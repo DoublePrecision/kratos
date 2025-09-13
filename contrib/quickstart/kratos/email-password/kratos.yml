@@ -73,6 +73,14 @@ selfservice:
     login:
       ui_url: http://localhost:3000/auth/login
       lifespan: 10m
+      after:
+        default_browser_return_url: http://localhost:3000/ # Or your desired dashboard URL
+        hooks:
+          - hook: web_hook
+            config:
+              url: http://localhost:3000
+              method: GET
+              can_interrupt: false
 
     registration:
       lifespan: 10m
