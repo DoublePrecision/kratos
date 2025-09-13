@@ -11,18 +11,29 @@ serve:
         - http://localhost:3000
       allow_credentials: true
   admin:
-    base_url: http://kratos:4434/
+    base_url: http://localhost:4434/
 
 selfservice:
-  default_browser_return_url: http://127.0.0.1:4455/welcome
+  default_browser_return_url: http://localhost:4455/welcome
   allowed_return_urls:
-    - http://127.0.0.1:4455
+    - http://localhost:4455
     - http://localhost:19006/Callback
     - exp://localhost:8081/--/Callback
 
   methods:
     password:
       enabled: true
+    oidc:
+      enabled: true
+      config:
+        providers:
+          - id: github # A unique name for your UI to reference
+            provider: github
+            client_id: ${GITHUB_CLIENT_ID}
+            client_secret: ${GITHUB_CLIENT_SECRET}
+            mapper_url: file:///etc/config/kratos/oidc.github.jsonnet # Path inside the container
+            scope:
+              - user:email
     totp:
       config:
         issuer: Kratos
@@ -36,7 +47,7 @@ selfservice:
 
   flows:
     error:
-      ui_url: http://127.0.0.1:4455/error
+      ui_url: http://localhost:4455/error
 
     settings:
       ui_url: http://localhost:3000/auth/reset
@@ -60,7 +71,7 @@ selfservice:
         default_browser_return_url: http://localhost:3000/auth/login
 
     login:
-      ui_url: http://127.0.0.1:3000/auth/login
+      ui_url: http://localhost:3000/auth/login
       lifespan: 10m
 
     registration:
@@ -76,7 +87,7 @@ log:
   level: debug
   format: text
   leak_sensitive_values: true
-  
+
 secrets:
   cookie:
     - PLEASE-CHANGE-ME-I-AM-VERY-INSECURE
