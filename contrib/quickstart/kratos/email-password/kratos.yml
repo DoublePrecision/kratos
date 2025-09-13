@@ -29,8 +29,8 @@ selfservice:
         providers:
           - id: github # A unique name for your UI to reference
             provider: github
-            client_id: env://GITHUB_CLIENT_ID
-            client_secret: env://GITHUB_CLIENT_SECRET
+            client_id: "placeholder-id"
+            client_secret: "placeholder-secret"
             mapper_url: file:///etc/config/kratos/oidc.github.jsonnet # Path inside the container
             scope:
               - user:email
