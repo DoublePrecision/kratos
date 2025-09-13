@@ -34,6 +34,14 @@ selfservice:
             mapper_url: file:///etc/config/kratos/oidc.github.jsonnet # Path inside the container
             scope:
               - user:email
+          - id: google
+            provider: google
+            client_id: "placeholder-id"
+            client_secret: "placeholder-secret"
+            mapper_url: file:///etc/config/kratos/oidc.google.jsonnet
+            scope:
+              - email
+              - profile
     totp:
       config:
         issuer: Kratos
