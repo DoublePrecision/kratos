@@ -10,19 +10,16 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/ory/kratos/driver/config"
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	hash2 "github.com/ory/kratos/hash"
-
+	"github.com/go-faker/faker/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/go-faker/faker/v4"
-
+	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hash"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/selfservice/strategy/password"
+	"github.com/ory/x/contextx"
 )
 
 func generateRandomConfig(t *testing.T) (identity.CredentialsPassword, []byte) {
@@ -35,21 +32,22 @@ func generateRandomConfig(t *testing.T) (identity.CredentialsPassword, []byte) {
 }
 
 func TestCountActiveFirstFactorCredentials(t *testing.T) {
-	ctx := context.Background()
-	_, reg := internal.NewFastRegistryWithMocks(t)
+	t.Parallel()
+
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	strategy := password.NewStrategy(reg)
 
-	h1, err := hash2.NewHasherBcrypt(reg).Generate(context.Background(), []byte("a password"))
+	h1, err := hash.NewHasherBcrypt(reg).Generate(t.Context(), []byte("a password"))
 	require.NoError(t, err)
-	h2, err := reg.Hasher(ctx).Generate(context.Background(), []byte("a password"))
+	h2, err := reg.Hasher(t.Context()).Generate(t.Context(), []byte("a password"))
 	require.NoError(t, err)
 
 	t.Run("test regressions fixtures", func(t *testing.T) {
 		// This test ensures we do not add regressions to this method by, for example, adding a new field.
-		for k := 0; k < 100; k++ {
+		for k := range 100 {
 			t.Run(fmt.Sprintf("run=%d", k), func(t *testing.T) {
 				cred, c := generateRandomConfig(t)
-				actual, err := strategy.CountActiveFirstFactorCredentials(ctx, map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+				actual, err := strategy.CountActiveFirstFactorCredentials(t.Context(), map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 					Type:        strategy.ID(),
 					Identifiers: []string{"foo"},
 					Config:      c,
@@ -118,7 +116,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 					Config:      []byte(`{"use_password_migration_hook":true}`),
 				}},
 				expected: 1,
-				ctx:      confighelpers.WithConfigValue(ctx, config.ViperKeyPasswordMigrationHook+".enabled", true),
+				ctx:      contextx.WithConfigValue(t.Context(), config.ViperKeyPasswordMigrationHook+".enabled", true),
 			},
 			{
 				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
@@ -127,7 +125,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 					Config:      []byte(`{"use_password_migration_hook":true}`),
 				}},
 				expected: 0,
-				ctx:      confighelpers.WithConfigValue(ctx, config.ViperKeyPasswordMigrationHook+".enabled", false),
+				ctx:      contextx.WithConfigValue(t.Context(), config.ViperKeyPasswordMigrationHook+".enabled", false),
 			},
 			{
 				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
@@ -157,11 +155,11 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-				actual, err := strategy.CountActiveFirstFactorCredentials(cmp.Or(tc.ctx, ctx), tc.in)
+				actual, err := strategy.CountActiveFirstFactorCredentials(cmp.Or(tc.ctx, t.Context()), tc.in)
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expected, actual)
 
-				actual, err = strategy.CountActiveMultiFactorCredentials(cmp.Or(tc.ctx, ctx), tc.in)
+				actual, err = strategy.CountActiveMultiFactorCredentials(cmp.Or(tc.ctx, t.Context()), tc.in)
 				assert.NoError(t, err)
 				assert.Equal(t, 0, actual)
 			})

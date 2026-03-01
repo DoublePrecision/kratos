@@ -13,15 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/pkg"
 )
 
 func TestCountActiveFirstFactorCredentials(t *testing.T) {
-	_, reg := internal.NewFastRegistryWithMocks(t)
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	strategy := lookup.NewStrategy(reg)
 
 	t.Run("first factor", func(t *testing.T) {
-		actual, err := strategy.CountActiveFirstFactorCredentials(nil, nil)
+		actual, err := strategy.CountActiveFirstFactorCredentials(t.Context(), nil)
 		require.NoError(t, err)
 		assert.Equal(t, 0, actual)
 	})
@@ -66,7 +66,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-				actual, err := strategy.CountActiveMultiFactorCredentials(nil, tc.in)
+				actual, err := strategy.CountActiveMultiFactorCredentials(t.Context(), tc.in)
 				require.NoError(t, err)
 				assert.Equal(t, tc.expected, actual)
 			})

@@ -6,6 +6,7 @@ package webauthn
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -71,9 +72,6 @@ type updateRegistrationFlowWithWebAuthnMethod struct {
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
 }
 
-func (s *Strategy) RegisterRegistrationRoutes(_ *x.RouterPublic) {
-}
-
 func (s *Strategy) handleRegistrationError(r *http.Request, f *registration.Flow, p updateRegistrationFlowWithWebAuthnMethod, err error) error {
 	if f != nil {
 		for _, n := range container.NewFromJSON("", node.DefaultGroup, p.Traits, "traits").Nodes {
@@ -91,8 +89,8 @@ func (s *Strategy) handleRegistrationError(r *http.Request, f *registration.Flow
 	return err
 }
 
-func (s *Strategy) decode(p *updateRegistrationFlowWithWebAuthnMethod, r *http.Request) error {
-	return registration.DecodeBody(p, r, s.hd, s.d.Config(), registrationSchema)
+func (s *Strategy) decode(p *updateRegistrationFlowWithWebAuthnMethod, r *http.Request, ds *url.URL) error {
+	return registration.DecodeBody(p, r, registrationSchema, ds)
 }
 
 func (s *Strategy) Register(_ http.ResponseWriter, r *http.Request, regFlow *registration.Flow, i *identity.Identity) (err error) {
@@ -104,8 +102,13 @@ func (s *Strategy) Register(_ http.ResponseWriter, r *http.Request, regFlow *reg
 		return flow.ErrStrategyNotResponsible
 	}
 
+	ds, err := regFlow.IdentitySchema.URL(ctx, s.d.Config())
+	if err != nil {
+		return err
+	}
+
 	var p updateRegistrationFlowWithWebAuthnMethod
-	if err := s.decode(&p, r); err != nil {
+	if err := s.decode(&p, r, ds); err != nil {
 		return s.handleRegistrationError(r, regFlow, p, err)
 	}
 

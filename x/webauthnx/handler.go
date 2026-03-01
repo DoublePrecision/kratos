@@ -7,9 +7,7 @@ import (
 	_ "embed"
 	"net/http"
 
-	"github.com/julienschmidt/httprouter"
-
-	"github.com/ory/kratos/x"
+	"github.com/ory/x/httprouterx"
 )
 
 //go:embed js/webauthn.js
@@ -44,11 +42,12 @@ type webAuthnJavaScript string
 //
 //	Responses:
 //	  200: webAuthnJavaScript
-func RegisterWebauthnRoute(r *x.RouterPublic) {
-	if handle, _, _ := r.Lookup("GET", ScriptURL); handle == nil {
-		r.GET(ScriptURL, func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-			w.Header().Set("Content-Type", "text/javascript; charset=UTF-8")
-			_, _ = w.Write(jsOnLoad)
-		})
-	}
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-public-low
+func RegisterWebauthnRoute(r *httprouterx.RouterPublic) {
+	r.GET(ScriptURL, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=UTF-8")
+		_, _ = w.Write(jsOnLoad)
+	})
 }

@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"net/url"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -90,8 +91,6 @@ func (s *Strategy) ID() identity.CredentialsType {
 	return identity.CredentialsTypeProfile
 }
 
-func (s *Strategy) RegisterRegistrationRoutes(*x.RouterPublic) {}
-
 func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
 	f.UI.Nodes.Append(nodePreviousScreen())
 	f.UI.Nodes.RemoveMatching(nodeSubmitProfile())
@@ -110,7 +109,7 @@ func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *reg
 }
 
 func (s *Strategy) PopulateRegistrationMethodProfile(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -140,7 +139,7 @@ func (s *Strategy) PopulateRegistrationMethodProfile(r *http.Request, f *registr
 }
 
 func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) error {
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -158,13 +157,13 @@ func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.F
 	return nil
 }
 
-func (s *Strategy) decode(p *updateRegistrationFlowWithProfileMethod, r *http.Request) error {
+func (s *Strategy) decode(p *updateRegistrationFlowWithProfileMethod, r *http.Request, ds *url.URL) error {
 	compiler, err := decoderx.HTTPRawJSONSchemaCompiler(registrationSchema)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	if err := s.dc.Decode(r, p, compiler,
+	if err := decoderx.Decode(r, p, compiler,
 		decoderx.HTTPKeepRequestBody(true),
 		decoderx.HTTPDecoderSetValidatePayloads(false),
 		decoderx.HTTPDecoderJSONFollowsFormFormat(),
@@ -176,7 +175,7 @@ func (s *Strategy) decode(p *updateRegistrationFlowWithProfileMethod, r *http.Re
 		return errors.WithStack(flow.ErrStrategyNotResponsible)
 	}
 
-	return registration.DecodeBody(p, r, s.dc, s.d.Config(), registrationSchema)
+	return registration.DecodeBody(p, r, registrationSchema, ds)
 }
 
 func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, regFlow *registration.Flow, i *identity.Identity) (err error) {
@@ -189,10 +188,14 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, regFlow *reg
 
 	var params updateRegistrationFlowWithProfileMethod
 
-	if err = s.decode(&params, r); err != nil {
-		return s.handleRegistrationError(r, regFlow, params, err)
+	ds, err := regFlow.IdentitySchema.URL(ctx, s.d.Config())
+	if err != nil {
+		return err
 	}
 
+	if err = s.decode(&params, r, ds); err != nil {
+		return s.handleRegistrationError(r, regFlow, params, err)
+	}
 	if params.Method == "profile" || len(params.Screen) > 0 {
 		switch params.Screen {
 		case RegistrationScreenCredentialSelection:
@@ -232,7 +235,7 @@ func (s *Strategy) returnToProfileForm(ctx context.Context, w http.ResponseWrite
 		}
 	}
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := regFlow.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return s.handleRegistrationError(r, regFlow, params, err)
 	}
@@ -301,7 +304,7 @@ func (s *Strategy) showCredentialsSelection(ctx context.Context, w http.Response
 
 	regFlow.UI.UpdateNodeValuesFromJSON(json.RawMessage(i.Traits), "traits", node.DefaultGroup)
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := regFlow.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return s.handleRegistrationError(r, regFlow, params, err)
 	}

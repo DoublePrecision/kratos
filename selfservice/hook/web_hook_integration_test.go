@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/julienschmidt/httprouter"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +31,7 @@ import (
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/request"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/flow"
@@ -51,7 +50,6 @@ import (
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/snapshotx"
 )
 
@@ -64,10 +62,10 @@ var transientPayload = json.RawMessage(`{
 
 func TestWebHooks(t *testing.T) {
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	logger := logrusx.New("kratos", "test")
 
-	conf.Set(ctx, config.ViperKeyWebhookHeaderAllowlist, []string{
+	conf.MustSet(ctx, config.ViperKeyWebhookHeaderAllowlist, []string{
 		"Accept",
 		"Accept-Encoding",
 		"Accept-Language",
@@ -89,11 +87,11 @@ func TestWebHooks(t *testing.T) {
 	})
 
 	whDeps := struct {
-		x.SimpleLoggerWithClient
+		x.BasicRegistry
 		*jsonnetsecure.TestProvider
 		config.Provider
 	}{
-		x.SimpleLoggerWithClient{L: logger, C: reg.HTTPClient(ctx), T: otelx.NewNoop(logger, &otelx.Config{ServiceName: "kratos"})},
+		x.BasicRegistry{L: logger, C: reg.HTTPClient(ctx), T: otelx.NewNoop()},
 		jsonnetsecure.NewTestProvider(t),
 		reg,
 	}
@@ -103,8 +101,8 @@ func TestWebHooks(t *testing.T) {
 		Method  string
 	}
 
-	webHookEndPoint := func(whr *WebHookRequest) httprouter.Handle {
-		return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	webHookEndPoint := func(whr *WebHookRequest) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -116,14 +114,14 @@ func TestWebHooks(t *testing.T) {
 		}
 	}
 
-	webHookHttpCodeEndPoint := func(code int) httprouter.Handle {
-		return func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	webHookHttpCodeEndPoint := func(code int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(code)
 		}
 	}
 
-	webHookHttpCodeWithBodyEndPoint := func(t *testing.T, code int, body []byte) httprouter.Handle {
-		return func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	webHookHttpCodeWithBodyEndPoint := func(t *testing.T, code int, body []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(code)
 			_, err := w.Write(body)
 			assert.NoError(t, err, "error while returning response from webHookHttpCodeWithBodyEndPoint")
@@ -131,17 +129,17 @@ func TestWebHooks(t *testing.T) {
 	}
 
 	path := "/web_hook"
-	newServer := func(f httprouter.Handle) *httptest.Server {
-		r := httprouter.New()
+	newServer := func(f http.HandlerFunc) *httptest.Server {
+		r := http.NewServeMux()
 
-		r.Handle("CONNECT", path, f)
-		r.DELETE(path, f)
-		r.GET(path, f)
-		r.OPTIONS(path, f)
-		r.PATCH(path, f)
-		r.POST(path, f)
-		r.PUT(path, f)
-		r.Handle("TRACE", path, f)
+		r.HandleFunc("CONNECT "+path, f)
+		r.HandleFunc("DELETE "+path, f)
+		r.HandleFunc("GET "+path, f)
+		r.HandleFunc("OPTIONS "+path, f)
+		r.HandleFunc("PATCH "+path, f)
+		r.HandleFunc("POST "+path, f)
+		r.HandleFunc("PUT "+path, f)
+		r.HandleFunc("TRACE "+path, f)
 
 		ts := httptest.NewServer(r)
 		t.Cleanup(ts.Close)
@@ -291,7 +289,7 @@ func TestWebHooks(t *testing.T) {
 				return wh.ExecuteSettingsPostPersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
 			},
 			expectedBody: func(req *http.Request, f flow.Flow, s *session.Session) string {
-				return bodyWithFlowAndIdentityAndTransientPayload(req, f, s, transientPayload)
+				return bodyWithFlowAndIdentityAndSessionAndTransientPayload(req, f, s, transientPayload)
 			},
 		},
 	} {
@@ -613,7 +611,7 @@ func TestWebHooks(t *testing.T) {
 			uc:         "Post Settings Hook Pre Persist - block",
 			createFlow: func() flow.Flow { return &settings.Flow{ID: x.NewUUID()} },
 			callWebHook: func(wh *hook.WebHook, req *http.Request, f flow.Flow, s *session.Session) error {
-				return wh.ExecuteSettingsPrePersistHook(nil, req, f.(*settings.Flow), s.Identity)
+				return wh.ExecuteSettingsPrePersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
 			},
 			webHookResponse: func() (int, []byte) {
 				return http.StatusBadRequest, webHookResponse
@@ -707,11 +705,18 @@ func TestWebHooks(t *testing.T) {
 
 		t.Run("case=update identity fields", func(t *testing.T) {
 			expected := identity.Identity{
-				Credentials: map[identity.CredentialsType]identity.Credentials{identity.CredentialsTypePassword: {Type: "password", Identifiers: []string{"test"}, Config: []byte(`{"hashed_password":"$argon2id$v=19$m=65536,t=1,p=1$Z3JlZW5hbmRlcnNlY3JldA$Z3JlZW5hbmRlcnNlY3JldA"}`)}},
-				SchemaID:    "default",
-				SchemaURL:   "file://stub/default.schema.json",
-				State:       identity.StateActive,
-				Traits:      []byte(`{"email":"some@example.org"}`),
+				Credentials: map[identity.CredentialsType]identity.Credentials{
+					identity.CredentialsTypePassword: {
+						Type:        "password",
+						Identifiers: []string{"test"},
+						Config:      []byte(`{"hashed_password":"$argon2id$v=19$m=65536,t=1,p=1$Z3JlZW5hbmRlcnNlY3JldA$Z3JlZW5hbmRlcnNlY3JldA"}`),
+					},
+				},
+				ExternalID: "original-external-id",
+				SchemaID:   "default",
+				SchemaURL:  "file://stub/default.schema.json",
+				State:      identity.StateActive,
+				Traits:     []byte(`{"email":"some@example.org"}`),
 				VerifiableAddresses: []identity.VerifiableAddress{{
 					Value:    "some@example.org",
 					Verified: false,
@@ -763,6 +768,16 @@ func TestWebHooks(t *testing.T) {
 
 			t.Run("case=identity has updated recovery addresses", func(t *testing.T) {
 				actual := run(t, expected, http.StatusOK, []byte(`{"identity":{"traits":{"email":"some@other-example.org"},"recovery_addresses":[{"value":"some@other-example.org","via":"email"}]}}`))
+				snapshotx.SnapshotT(t, &actual)
+			})
+
+			t.Run("case=identity has updated external_id", func(t *testing.T) {
+				actual := run(t, expected, http.StatusOK, []byte(`{"identity":{"external_id":"updated-external-id"}}`))
+				snapshotx.SnapshotT(t, &actual)
+			})
+
+			t.Run("case=unset external_id", func(t *testing.T) {
+				actual := run(t, expected, http.StatusOK, []byte(`{"identity":{"external_id":""}}`))
 				snapshotx.SnapshotT(t, &actual)
 			})
 		})
@@ -829,7 +844,7 @@ func TestWebHooks(t *testing.T) {
 			assert.NoError(t, postPersistErr)
 			assert.Equal(t, in, &identity.Identity{ID: uuid})
 
-			prePersistErr := wh.ExecuteSettingsPrePersistHook(nil, req, f, in)
+			prePersistErr := wh.ExecuteSettingsPrePersistHook(nil, req, f, in, s)
 			assert.NoError(t, prePersistErr)
 			if tc.parse == true {
 				assert.Equal(t, in, &identity.Identity{ID: uuid, Traits: identity.Traits(`{"email":"some@other-example.org"}`)})
@@ -917,7 +932,7 @@ func TestWebHooks(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		waitTime := time.Millisecond * 100
-		ts := newServer(func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+		ts := newServer(func(w http.ResponseWriter, _ *http.Request) {
 			defer wg.Done()
 			time.Sleep(waitTime)
 			w.WriteHeader(http.StatusBadRequest)
@@ -956,7 +971,7 @@ func TestWebHooks(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(3) // HTTP client does 3 attempts
-		ts := newServer(func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		ts := newServer(func(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			w.WriteHeader(500)
 			_, _ = w.Write([]byte(`{"error":"some error"}`))
@@ -1027,16 +1042,16 @@ func TestWebHooks(t *testing.T) {
 func TestDisallowPrivateIPRanges(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	conf.MustSet(ctx, config.ViperKeyClientHTTPNoPrivateIPRanges, true)
 	conf.MustSet(ctx, config.ViperKeyClientHTTPPrivateIPExceptionURLs, []string{"http://localhost/exception"})
 	logger := logrusx.New("kratos", "test")
 	whDeps := struct {
-		x.SimpleLoggerWithClient
+		x.BasicRegistry
 		*jsonnetsecure.TestProvider
 		config.Provider
 	}{
-		x.SimpleLoggerWithClient{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop(logger, &otelx.Config{ServiceName: "kratos"})},
+		x.BasicRegistry{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop()},
 		jsonnetsecure.NewTestProvider(t),
 		reg,
 	}
@@ -1059,8 +1074,7 @@ func TestDisallowPrivateIPRanges(t *testing.T) {
 			TemplateURI: "file://stub/test_body.jsonnet",
 		})
 		err := wh.ExecuteLoginPostHook(nil, req, node.DefaultGroup, f, s)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "is not a permitted destination")
+		assert.ErrorContains(t, err, "is not a permitted destination")
 	})
 
 	t.Run("allowed to call exempt url", func(t *testing.T) {
@@ -1092,23 +1106,22 @@ func TestDisallowPrivateIPRanges(t *testing.T) {
 			TemplateURI: "http://192.168.178.0/test_body.jsonnet",
 		})
 		err := wh.ExecuteLoginPostHook(nil, req, node.DefaultGroup, f, s)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "is not a permitted destination")
+		require.ErrorContains(t, err, "is not a permitted destination")
 	})
 }
 
 func TestAsyncWebhook(t *testing.T) {
 	t.Parallel()
-	_, reg := internal.NewFastRegistryWithMocks(t)
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	logger := logrusx.New("kratos", "test")
 	logHook := new(test.Hook)
 	logger.Logger.Hooks.Add(logHook)
 	whDeps := struct {
-		x.SimpleLoggerWithClient
+		x.BasicRegistry
 		*jsonnetsecure.TestProvider
 		config.Provider
 	}{
-		x.SimpleLoggerWithClient{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop(logger, &otelx.Config{ServiceName: "kratos"})},
+		x.BasicRegistry{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop()},
 		jsonnetsecure.NewTestProvider(t),
 		reg,
 	}
@@ -1137,7 +1150,7 @@ func TestAsyncWebhook(t *testing.T) {
 	webhookReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(handlerEntered)
 		<-blockHandlerOnExit
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	}))
 	t.Cleanup(webhookReceiver.Close)
 
@@ -1182,14 +1195,14 @@ func TestAsyncWebhook(t *testing.T) {
 
 func TestWebhookEvents(t *testing.T) {
 	t.Parallel()
-	_, reg := internal.NewFastRegistryWithMocks(t)
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	logger := logrusx.New("kratos", "test")
 	whDeps := struct {
-		x.SimpleLoggerWithClient
+		x.BasicRegistry
 		*jsonnetsecure.TestProvider
 		config.Provider
 	}{
-		x.SimpleLoggerWithClient{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop(logger, &otelx.Config{ServiceName: "kratos"})},
+		x.BasicRegistry{L: logger, C: reg.HTTPClient(context.Background()), T: otelx.NewNoop()},
 		jsonnetsecure.NewTestProvider(t),
 		reg,
 	}
@@ -1206,10 +1219,10 @@ func TestWebhookEvents(t *testing.T) {
 	webhookReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ok" {
 			w.WriteHeader(200)
-			w.Write([]byte("ok"))
+			_, _ = w.Write([]byte("ok"))
 		} else {
 			w.WriteHeader(500)
-			w.Write([]byte("fail"))
+			_, _ = w.Write([]byte("fail"))
 		}
 	}))
 	t.Cleanup(webhookReceiver.Close)
@@ -1337,7 +1350,7 @@ func TestWebhookEvents(t *testing.T) {
 			URL:                webhookReceiver.URL + "/fail",
 			Method:             "GET",
 			TemplateURI:        "file://stub/test_body.jsonnet",
-			EmitAnalyticsEvent: pointerx.Ptr(false),
+			EmitAnalyticsEvent: new(false),
 		})
 
 		recorder := tracetest.NewSpanRecorder()
@@ -1371,5 +1384,41 @@ func TestWebhookEvents(t *testing.T) {
 			return ev.Name == "WebhookSucceeded"
 		})
 		require.Equal(t, i, -1)
+	})
+}
+
+func TestRemoveDisallowedHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty http headers", func(t *testing.T) {
+		headers := http.Header{}
+		allowList := []string{"Content-Type", "Host"}
+		newHeaders := hook.RemoveDisallowedHeaders(headers, allowList)
+
+		require.Len(t, newHeaders, 0)
+	})
+	t.Run("empty allow list", func(t *testing.T) {
+		headers := http.Header{"Accept": {"application/json"}, "Content-Type": {"text/html"}}
+		allowList := []string{}
+		newHeaders := hook.RemoveDisallowedHeaders(headers, allowList)
+
+		require.Len(t, newHeaders, 0)
+	})
+	t.Run("all forbidden", func(t *testing.T) {
+		headers := http.Header{"Accept": {"application/json"}, "Authorization": {"Bearer foo"}}
+		allowList := []string{"Content-Type", "Host"}
+		newHeaders := hook.RemoveDisallowedHeaders(headers, allowList)
+
+		require.Len(t, newHeaders, 0)
+	})
+	t.Run("general case", func(t *testing.T) {
+		headers := http.Header{"Accept": {"application/json"}, "Content-Type": {"text/html"}}
+		allowList := []string{"Content-Type", "Host"}
+		newHeaders := hook.RemoveDisallowedHeaders(headers, allowList)
+
+		require.Len(t, newHeaders, 1)
+		h, present := newHeaders["Content-Type"]
+		require.True(t, present)
+		require.Equal(t, []string{"text/html"}, h)
 	})
 }

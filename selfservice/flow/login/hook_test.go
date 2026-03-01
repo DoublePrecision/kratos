@@ -13,24 +13,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ory/x/configx"
+
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/kratos/driver/config"
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
 	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/contextx"
 )
 
 func TestLoginExecutor(t *testing.T) {
@@ -41,16 +43,16 @@ func TestLoginExecutor(t *testing.T) {
 		t.Run("strategy="+strategy.String(), func(t *testing.T) {
 			t.Parallel()
 
-			conf, reg := internal.NewFastRegistryWithMocks(t)
-			reg.WithHydra(hydra.NewFake())
+			conf, reg := pkg.NewFastRegistryWithMocks(t)
+			reg.SetHydra(hydra.NewFake())
 			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
 			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
 			_ = testhelpers.NewLoginUIFlowEchoServer(t, reg)
 
 			newServer := func(t *testing.T, ft flow.Type, useIdentity *identity.Identity, flowCallback ...func(*login.Flow)) *httptest.Server {
-				router := httprouter.New()
+				router := http.NewServeMux()
 
-				router.GET("/login/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /login/pre", func(w http.ResponseWriter, r *http.Request) {
 					loginFlow, err := login.NewFlow(conf, time.Minute, "", r, ft)
 					require.NoError(t, err)
 					if testhelpers.SelfServiceHookLoginErrorHandler(t, w, r, reg.LoginHookExecutor().PreLoginHook(w, r, loginFlow)) {
@@ -58,7 +60,7 @@ func TestLoginExecutor(t *testing.T) {
 					}
 				})
 
-				router.GET("/login/post", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /login/post", func(w http.ResponseWriter, r *http.Request) {
 					loginFlow, err := login.NewFlow(conf, time.Minute, "", r, ft)
 					require.NoError(t, err)
 					loginFlow.Active = strategy
@@ -77,7 +79,7 @@ func TestLoginExecutor(t *testing.T) {
 						reg.LoginHookExecutor().PostLoginHook(w, r, strategy.ToUiNodeGroup(), loginFlow, useIdentity, sess, ""))
 				})
 
-				router.GET("/login/post2fa", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /login/post2fa", func(w http.ResponseWriter, r *http.Request) {
 					loginFlow, err := login.NewFlow(conf, time.Minute, "", r, ft)
 					require.NoError(t, err)
 					loginFlow.Active = strategy
@@ -477,14 +479,13 @@ func TestLoginExecutor(t *testing.T) {
 	}
 
 	t.Run("method=checkAAL", func(t *testing.T) {
-		ctx := confighelpers.WithConfigValue(ctx, config.ViperKeyPublicBaseURL, returnToServer.URL)
-
-		conf, reg := internal.NewFastRegistryWithMocks(t)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
-		conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
+		_, reg := pkg.NewFastRegistryWithMocks(t, configx.WithValues(map[string]interface{}{
+			config.ViperKeyPublicBaseURL:                     returnToServer.URL,
+			config.ViperKeySelfServiceBrowserDefaultReturnTo: returnToServer.URL,
+		}), configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/login.schema.json")))
 
 		t.Run("returns no error when sufficient", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, identity.AuthenticatorAssuranceLevel1)
+			ctx := contextx.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, identity.AuthenticatorAssuranceLevel1)
 			assert.NoError(t,
 				login.CheckAALForTest(ctx, reg.LoginHookExecutor(), &session.Session{
 					AMR: session.AuthenticationMethods{{
@@ -495,7 +496,7 @@ func TestLoginExecutor(t *testing.T) {
 				}, nil),
 			)
 
-			ctx = confighelpers.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, config.HighestAvailableAAL)
+			ctx = contextx.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, config.HighestAvailableAAL)
 			assert.NoError(t,
 				login.CheckAALForTest(ctx, reg.LoginHookExecutor(), &session.Session{
 					AMR: session.AuthenticationMethods{{
@@ -511,7 +512,7 @@ func TestLoginExecutor(t *testing.T) {
 		})
 
 		t.Run("copies parameters to redirect URL when AAL is not sufficient", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, config.HighestAvailableAAL)
+			ctx := contextx.WithConfigValue(ctx, config.ViperKeySessionWhoAmIAAL, config.HighestAvailableAAL)
 			aalErr := new(session.ErrAALNotSatisfied)
 			require.ErrorAs(t,
 				login.CheckAALForTest(ctx, reg.LoginHookExecutor(), &session.Session{
@@ -521,7 +522,9 @@ func TestLoginExecutor(t *testing.T) {
 					}},
 					AuthenticatorAssuranceLevel: identity.AuthenticatorAssuranceLevel1,
 					Identity: &identity.Identity{
-						InternalAvailableAAL: identity.NullableAuthenticatorAssuranceLevel{sql.NullString{String: string(identity.AuthenticatorAssuranceLevel2), Valid: true}},
+						InternalAvailableAAL: identity.NullableAuthenticatorAssuranceLevel{
+							NullString: sql.NullString{String: string(identity.AuthenticatorAssuranceLevel2), Valid: true},
+						},
 					},
 				}, &login.Flow{
 					RequestURL: "https://www.ory.sh/?return_to=https://www.ory.sh/kratos&login_challenge=challenge",

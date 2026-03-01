@@ -15,38 +15,38 @@ import (
 	"github.com/ory/kratos/selfservice/flow/verification"
 
 	"github.com/gobuffalo/httptest"
-	"github.com/julienschmidt/httprouter"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/x"
 )
 
 func TestVerificationExecutor(t *testing.T) {
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 
 	newServer := func(t *testing.T, i *identity.Identity, ft flow.Type) *httptest.Server {
-		router := httprouter.New()
-		router.GET("/verification/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-			strategy, err := reg.GetActiveVerificationStrategy(r.Context())
+		router := http.NewServeMux()
+		router.HandleFunc("GET /verification/pre", func(w http.ResponseWriter, r *http.Request) {
+			strategies, _, err := reg.GetActiveVerificationStrategies(r.Context())
 			require.NoError(t, err)
-			a, err := verification.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, strategy, ft)
+			a, err := verification.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, strategies, ft)
 			require.NoError(t, err)
 			if testhelpers.SelfServiceHookErrorHandler(t, w, r, verification.ErrHookAbortFlow, reg.VerificationExecutor().PreVerificationHook(w, r, a)) {
 				_, _ = w.Write([]byte("ok"))
 			}
 		})
 
-		router.GET("/verification/post", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-			strategy, err := reg.GetActiveVerificationStrategy(r.Context())
+		router.HandleFunc("GET /verification/post", func(w http.ResponseWriter, r *http.Request) {
+			strategies, _, err := reg.GetActiveVerificationStrategies(r.Context())
 			require.NoError(t, err)
-			a, err := verification.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, strategy, ft)
+			a, err := verification.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, strategies, ft)
 			require.NoError(t, err)
 			a.RequestURL = x.RequestURL(r).String()
 			if testhelpers.SelfServiceHookErrorHandler(t, w, r, verification.ErrHookAbortFlow, reg.VerificationExecutor().PostVerificationHook(w, r, a, i)) {

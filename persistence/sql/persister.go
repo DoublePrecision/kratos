@@ -7,10 +7,10 @@ import (
 	"context"
 	"embed"
 	"io/fs"
+	"slices"
 	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/ory/pop/v6"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
@@ -19,11 +19,13 @@ import (
 	"github.com/ory/kratos/persistence"
 	"github.com/ory/kratos/persistence/sql/devices"
 	idpersistence "github.com/ory/kratos/persistence/sql/identity"
+	gomigrations "github.com/ory/kratos/persistence/sql/migrations/go"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/session"
-	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/fsx"
+	"github.com/ory/x/logrusx"
 	"github.com/ory/x/networkx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/popx"
@@ -32,14 +34,14 @@ import (
 var _ persistence.Persister = new(Persister)
 
 //go:embed migrations/sql/*.sql
-var migrations embed.FS
+var Migrations embed.FS
 
 type (
 	persisterDependencies interface {
-		x.LoggingProvider
+		logrusx.Provider
 		config.Provider
 		contextx.Provider
-		x.TracingProvider
+		otelx.Provider
 		schema.IdentitySchemaProvider
 		identity.ValidationProvider
 	}
@@ -49,41 +51,40 @@ type (
 		mb  *popx.MigrationBox
 		mbs popx.MigrationStatuses
 		r   persisterDependencies
-		p   *networkx.Manager
 
 		identity.PrivilegedPool
 		session.DevicePersister
 	}
 )
 
-type persisterOptions struct {
+type options struct {
 	extraMigrations   []fs.FS
 	extraGoMigrations popx.Migrations
 	disableLogging    bool
 }
 
-type persisterOption func(o *persisterOptions)
+type Option = func(o *options)
 
-func WithExtraMigrations(fss ...fs.FS) persisterOption {
-	return func(o *persisterOptions) {
+func WithExtraMigrations(fss ...fs.FS) Option {
+	return func(o *options) {
 		o.extraMigrations = fss
 	}
 }
 
-func WithExtraGoMigrations(ms ...popx.Migration) persisterOption {
-	return func(o *persisterOptions) {
+func WithExtraGoMigrations(ms ...popx.Migration) Option {
+	return func(o *options) {
 		o.extraGoMigrations = ms
 	}
 }
 
-func WithDisabledLogging(v bool) persisterOption {
-	return func(o *persisterOptions) {
+func WithDisabledLogging(v bool) Option {
+	return func(o *options) {
 		o.disableLogging = v
 	}
 }
 
-func NewPersister(ctx context.Context, r persisterDependencies, c *pop.Connection, opts ...persisterOption) (*Persister, error) {
-	o := &persisterOptions{}
+func NewPersister(r persisterDependencies, c *pop.Connection, opts ...Option) (*Persister, error) {
+	o := &options{}
 	for _, f := range opts {
 		f(o)
 	}
@@ -92,22 +93,20 @@ func NewPersister(ctx context.Context, r persisterDependencies, c *pop.Connectio
 		logger.Logrus().SetLevel(logrus.WarnLevel)
 	}
 	m, err := popx.NewMigrationBox(
-		fsx.Merge(append([]fs.FS{migrations, networkx.Migrations}, o.extraMigrations...)...),
-		popx.NewMigrator(c, logger, r.Tracer(ctx), 0),
-		popx.WithGoMigrations(o.extraGoMigrations),
+		fsx.Merge(append([]fs.FS{Migrations, networkx.Migrations}, o.extraMigrations...)...),
+		c, logger,
+		popx.WithGoMigrations(slices.Concat(gomigrations.All, o.extraGoMigrations)),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	m.DumpMigrations = false
 	return &Persister{
 		c:               c,
 		mb:              m,
 		r:               r,
 		PrivilegedPool:  idpersistence.NewPersister(r, c),
 		DevicePersister: devices.NewPersister(r, c),
-		p:               networkx.NewManager(c, r.Logger(), r.Tracer(ctx)),
 	}, nil
 }
 
@@ -131,7 +130,7 @@ func (p Persister) WithNetworkID(nid uuid.UUID) persistence.Persister {
 }
 
 func (p *Persister) DetermineNetwork(ctx context.Context) (*networkx.Network, error) {
-	return p.p.Determine(ctx)
+	return networkx.Determine(p.Connection(ctx))
 }
 
 func (p *Persister) Connection(ctx context.Context) *pop.Connection {
@@ -170,10 +169,6 @@ func (p *Persister) MigrationBox() *popx.MigrationBox {
 	return p.mb
 }
 
-func (p *Persister) Migrator() *popx.Migrator {
-	return p.mb.Migrator
-}
-
 func (p *Persister) Close(ctx context.Context) error {
 	return errors.WithStack(p.GetConnection(ctx).Close())
 }
@@ -210,7 +205,7 @@ func (p *Persister) CleanupDatabase(ctx context.Context, wait time.Duration, old
 	}
 	time.Sleep(wait)
 
-	p.r.Logger().Println("Cleaning up expired registation flows")
+	p.r.Logger().Println("Cleaning up expired registration flows")
 	if err := p.DeleteExpiredRegistrationFlows(ctx, currentTime, batchSize); err != nil {
 		return err
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/events"
 	"github.com/ory/x/fetcher"
+	"github.com/ory/x/httpx"
 	"github.com/ory/x/jsonnetsecure"
 	"github.com/ory/x/jwksx"
 	"github.com/ory/x/otelx"
@@ -28,8 +29,8 @@ import (
 type (
 	tokenizerDependencies interface {
 		jsonnetsecure.VMProvider
-		x.TracingProvider
-		x.HTTPClientProvider
+		otelx.Provider
+		httpx.ClientProvider
 		config.Provider
 		x.JWKSFetchProvider
 	}
@@ -54,6 +55,21 @@ func NewTokenizer(r tokenizerDependencies) *Tokenizer {
 
 func (s *Tokenizer) SetNowFunc(t func() time.Time) {
 	s.nowFunc = t
+}
+
+func SetSubjectClaim(claims jwt.MapClaims, session *Session, subjectSource string) error {
+	switch subjectSource {
+	case "", "id":
+		claims["sub"] = session.IdentityID.String()
+	case "external_id":
+		if session.Identity.ExternalID == "" {
+			return errors.WithStack(herodot.ErrBadRequest.WithReasonf("The session's identity does not have an external ID set, but it is required for the subject claim."))
+		}
+		claims["sub"] = session.Identity.ExternalID.String()
+	default:
+		return errors.WithStack(herodot.ErrBadRequest.WithReasonf("Unknown subject source %q", subjectSource))
+	}
+	return nil
 }
 
 func (s *Tokenizer) TokenizeSession(ctx context.Context, template string, session *Session) (err error) {
@@ -96,10 +112,13 @@ func (s *Tokenizer) TokenizeSession(ctx context.Context, template string, sessio
 		"jti": uuid.Must(uuid.NewV4()).String(),
 		"iss": s.r.Config().SelfPublicURL(ctx).String(),
 		"exp": now.Add(tpl.TTL).Unix(),
-		"sub": session.IdentityID.String(),
 		"sid": session.ID.String(),
 		"nbf": now.Unix(),
 		"iat": now.Unix(),
+	}
+
+	if err = SetSubjectClaim(claims, session, tpl.SubjectSource); err != nil {
+		return err
 	}
 
 	if mapper := tpl.ClaimsMapperURL; len(mapper) > 0 {
@@ -140,8 +159,9 @@ func (s *Tokenizer) TokenizeSession(ctx context.Context, template string, sessio
 		if err := json.Unmarshal([]byte(evaluatedClaims.Raw), &claims); err != nil {
 			return errors.WithStack(herodot.ErrBadRequest.WithWrap(err).WithReasonf("Unable to encode tokenized claims."))
 		}
-
-		claims["sub"] = session.IdentityID.String()
+	}
+	if err = SetSubjectClaim(claims, session, tpl.SubjectSource); err != nil {
+		return err
 	}
 
 	var privateKey interface{}

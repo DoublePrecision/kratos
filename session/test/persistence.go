@@ -5,34 +5,26 @@ package test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
-
-	"github.com/ory/x/dbal"
-
-	"github.com/ory/pop/v6"
-
-	"github.com/ory/x/pagination/keysetpagination"
-
-	"github.com/ory/x/pointerx"
-
-	"github.com/ory/kratos/identity"
-
 	"github.com/go-faker/faker/v4"
 	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/kratos/driver/config"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/persistence"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/dbal"
+	"github.com/ory/x/pagination/keysetpagination"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/sqlcon"
 )
@@ -94,6 +86,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 					assert.Equal(t, *expected.Devices[i].IPAddress, *d.IPAddress)
 					assert.Equal(t, expected.Devices[i].UserAgent, d.UserAgent)
 					assert.Equal(t, *expected.Devices[i].Location, *d.Location)
+					assert.Equal(t, *expected.Devices[i].IdentityID, *d.IdentityID)
 				}
 			}
 
@@ -157,7 +150,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 
 			seedSessionIDs := make([]uuid.UUID, 5)
 			seedSessionsList := make([]session.Session, 5)
-			start := time.Now()
+			now := time.Now()
 			for j := range seedSessionsList {
 				require.NoError(t, faker.FakeData(&seedSessionsList[j]))
 				seedSessionsList[j].Identity = &identity1
@@ -174,13 +167,16 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				seedSessionsList[j].Devices = []session.Device{
 					device,
 				}
-				pop.SetNowFunc(func() time.Time {
-					return start.Add(time.Duration(j) * time.Minute)
-				})
 				require.NoError(t, l.UpsertSession(ctx, &seedSessionsList[j]))
+				require.NoError(t, p.GetConnection(ctx).
+					RawQuery(
+						"UPDATE sessions SET created_at = ?, updated_at = ? WHERE id = ?",
+						now.Add(time.Duration(j)*time.Minute).Round(time.Second),
+						now.Add(time.Duration(j)*time.Minute).Round(time.Second),
+						seedSessionsList[j].ID).
+					Exec())
 				seedSessionIDs[j] = seedSessionsList[j].ID
 			}
-			pop.SetNowFunc(time.Now)
 
 			identity2Session.Identity = &identity2
 			identity2Session.Active = true
@@ -209,7 +205,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only",
-					active: pointerx.Bool(true),
+					active: new(true),
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[0],
 						seedSessionIDs[2],
@@ -218,7 +214,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only and except",
-					active: pointerx.Bool(true),
+					active: new(true),
 					except: seedSessionsList[0].ID,
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[2],
@@ -227,7 +223,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only",
-					active: pointerx.Bool(false),
+					active: new(false),
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[1],
 						seedSessionIDs[3],
@@ -235,7 +231,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only and except",
-					active: pointerx.Bool(false),
+					active: new(false),
 					except: seedSessionsList[3].ID,
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[1],
@@ -276,7 +272,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only",
-					active: pointerx.Bool(true),
+					active: new(true),
 					expected: []session.Session{
 						seedSessionsList[0],
 						seedSessionsList[2],
@@ -286,7 +282,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only",
-					active: pointerx.Bool(false),
+					active: new(false),
 					expected: []session.Session{
 						seedSessionsList[1],
 						seedSessionsList[3],
@@ -607,7 +603,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 		})
 
 		t.Run("extend session lifespan but min time is not yet reached", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
+			ctx := contextx.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))
@@ -622,7 +618,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 		})
 
 		t.Run("extend session lifespan", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
+			ctx := contextx.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))
@@ -642,7 +638,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				t.Skip("Skipping test because driver is not CockroachDB")
 			}
 
-			ctx := confighelpers.WithConfigValue(ctx, config.ViperKeySessionRefreshMinTimeLeft, 2*time.Hour)
+			ctx := contextx.WithConfigValue(ctx, config.ViperKeySessionRefreshMinTimeLeft, 2*time.Hour)
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))
@@ -652,13 +648,13 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 
 			expectedExpiry := expected.Refresh(ctx, conf).ExpiresAt
 
-			foundExpectedCockroachError := false
+			foundExpectedCockroachError := atomic.Bool{}
 			g := errgroup.Group{}
 			for range 10 {
 				g.Go(func() error {
 					err := p.ExtendSession(ctx, expected.ID)
 					if errors.Is(err, sqlcon.ErrNoRows) {
-						foundExpectedCockroachError = true
+						foundExpectedCockroachError.Store(true)
 						return nil
 					}
 					return err
@@ -669,7 +665,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			actual, err := p.GetSession(ctx, expected.ID, session.ExpandNothing)
 			require.NoError(t, err)
 			assert.LessOrEqual(t, expectedExpiry.Sub(actual.ExpiresAt).Abs(), 10*time.Second)
-			assert.True(t, foundExpectedCockroachError, "We expect to find a not found error caused by ... FOR UPDATE SKIP LOCKED")
+			assert.True(t, foundExpectedCockroachError.Load(), "We expect to find a not found error caused by ... FOR UPDATE SKIP LOCKED")
 		})
 	}
 }

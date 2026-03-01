@@ -13,36 +13,34 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/oauth2"
-
-	"github.com/julienschmidt/httprouter"
-	"github.com/urfave/negroni"
-
-	hydraclientgo "github.com/ory/hydra-client-go/v2"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/negroni"
+	"golang.org/x/oauth2"
 
+	hydraclientgo "github.com/ory/hydra-client-go/v2"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/configx"
 )
 
 func TestOAuth2ProviderRegistration(t *testing.T) {
-	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(ctx, "selfservice.flows.registration.enable_legacy_one_step", true)
+	t.Parallel()
 
-	kratosPublicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, x.NewRouterPublic(), x.NewRouterAdmin())
+	ctx := context.Background()
+	conf, reg := pkg.NewFastRegistryWithMocks(t, configx.WithValue(config.ViperKeySelfServiceRegistrationEnableLegacyOneStep, true))
+
+	kratosPublicTS, _ := testhelpers.NewKratosServer(t, reg)
 	errTS := testhelpers.NewErrorTestServer(t, reg)
 	redirTS := testhelpers.NewRedirSessionEchoTS(t, reg)
 
 	var hydraAdminClient hydraclientgo.OAuth2API
 
-	router := x.NewRouterPublic()
+	router := http.NewServeMux()
 
 	type contextKey string
 	const (
@@ -50,7 +48,7 @@ func TestOAuth2ProviderRegistration(t *testing.T) {
 		TestOAuthClientState contextKey = "test-oauth-client-state"
 	)
 
-	router.GET("/login-ts", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /login-ts", func(w http.ResponseWriter, r *http.Request) {
 		t.Log("[loginTS] navigated to the login ui")
 		c := r.Context().Value(TestUIConfig).(*testConfig)
 		*c.callTrace = append(*c.callTrace, LoginUI)
@@ -76,7 +74,7 @@ func TestOAuth2ProviderRegistration(t *testing.T) {
 		}
 	})
 
-	router.GET("/registration-ts", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /registration-ts", func(w http.ResponseWriter, r *http.Request) {
 		t.Log("[registrationTS] navigated to the registration ui")
 		c := r.Context().Value(TestUIConfig).(*testConfig)
 		*c.callTrace = append(*c.callTrace, RegistrationUI)
@@ -144,7 +142,7 @@ func TestOAuth2ProviderRegistration(t *testing.T) {
 		}
 	})
 
-	router.GET("/consent", func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	router.HandleFunc("GET /consent", func(w http.ResponseWriter, r *http.Request) {
 		t.Log("[consentTS] navigated to the consent ui")
 		c := r.Context().Value(TestUIConfig).(*testConfig)
 		*c.callTrace = append(*c.callTrace, Consent)

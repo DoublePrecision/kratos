@@ -26,7 +26,7 @@ export default defineConfig({
   projects: [
     {
       name: "mobile-chrome",
-      testMatch: "mobile/**/*.spec.ts",
+      testMatch: /.*\/mobile\/.*\.spec\.ts/,
       use: {
         ...devices["Pixel 5"],
         baseURL: "http://localhost:19006",
@@ -34,7 +34,7 @@ export default defineConfig({
     },
     {
       name: "chromium",
-      testMatch: "desktop/**/*.spec.ts",
+      testMatch: /.*\/desktop\/.*\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         baseURL: "http://localhost:4455",
@@ -56,7 +56,7 @@ export default defineConfig({
         COURIER_SMTP_CONNECTION_URI:
           "smtp://localhost:8026/?disable_starttls=true",
       },
-      timeout: 5 * 60 * 1000, // 5 minutes
+      timeout: 7 * 60 * 1000, // 7 minutes
     },
     {
       command: "go tool MailHog -smtp-bind-addr=localhost:8026",

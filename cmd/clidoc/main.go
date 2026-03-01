@@ -47,7 +47,8 @@ func init() {
 		"NewInfoNodeLabelVerificationCode":           text.NewInfoNodeLabelVerificationCode(),
 		"NewInfoNodeLabelRecoveryCode":               text.NewInfoNodeLabelRecoveryCode(),
 		"NewInfoNodeInputPassword":                   text.NewInfoNodeInputPassword(),
-		"NewInfoNodeLabelGenerated":                  text.NewInfoNodeLabelGenerated("{title}"),
+		"NewInfoNodeInputPhoneNumber":                text.NewInfoNodeInputPhoneNumber(),
+		"NewInfoNodeLabelGenerated":                  text.NewInfoNodeLabelGenerated("{title}", "{name}"),
 		"NewInfoNodeLabelSave":                       text.NewInfoNodeLabelSave(),
 		"NewInfoNodeLabelSubmit":                     text.NewInfoNodeLabelSubmit(),
 		"NewInfoNodeLabelID":                         text.NewInfoNodeLabelID(),
@@ -82,6 +83,7 @@ func init() {
 		"NewErrorValidationVerificationStateFailure":              text.NewErrorValidationVerificationStateFailure(),
 		"NewErrorValidationVerificationCodeInvalidOrAlreadyUsed":  text.NewErrorValidationVerificationCodeInvalidOrAlreadyUsed(),
 		"NewErrorSystemGeneric":                                   text.NewErrorSystemGeneric("{reason}"),
+		"NewErrorSystemNoAuthenticationMethodsAvailable":          text.NewErrorSystemNoAuthenticationMethodsAvailable(),
 		"NewValidationErrorGeneric":                               text.NewValidationErrorGeneric("{reason}"),
 		"NewValidationErrorRequired":                              text.NewValidationErrorRequired("{property}"),
 		"NewErrorValidationMinLength":                             text.NewErrorValidationMinLength(5, 3),
@@ -103,6 +105,7 @@ func init() {
 		"NewErrorValidationPasswordMinLength":                     text.NewErrorValidationPasswordMinLength(6, 5),
 		"NewErrorValidationPasswordMaxLength":                     text.NewErrorValidationPasswordMaxLength(72, 80),
 		"NewErrorValidationPasswordTooManyBreaches":               text.NewErrorValidationPasswordTooManyBreaches(101),
+		"NewErrorValidationPasswordNewSameAsOld":                  text.NewErrorValidationPasswordNewSameAsOld(),
 		"NewErrorValidationInvalidCredentials":                    text.NewErrorValidationInvalidCredentials(),
 		"NewErrorValidationDuplicateCredentials":                  text.NewErrorValidationDuplicateCredentials(),
 		"NewErrorValidationDuplicateCredentialsWithHints":         text.NewErrorValidationDuplicateCredentialsWithHints([]string{"{available_credential_types_list}"}, []string{"{available_oidc_providers_list}"}, "{credential_identifier_hint}"),
@@ -144,6 +147,11 @@ func init() {
 		"NewRecoverySuccessful":                                   text.NewRecoverySuccessful(inAMinute),
 		"NewRecoveryEmailSent":                                    text.NewRecoveryEmailSent(),
 		"NewRecoveryEmailWithCodeSent":                            text.NewRecoveryEmailWithCodeSent(),
+		"NewRecoveryCodeRecoverySelectAddressSent":                text.NewRecoveryCodeRecoverySelectAddressSent("{masked_address}"),
+		"NewRecoveryAskAnyRecoveryAddress":                        text.NewRecoveryAskAnyRecoveryAddress(),
+		"NewRecoveryAskForFullAddress":                            text.NewRecoveryAskForFullAddress(),
+		"NewRecoveryAskToChooseAddress":                           text.NewRecoveryAskToChooseAddress(),
+		"NewRecoveryBack":                                         text.NewRecoveryBack(),
 		"NewErrorValidationRecoveryTokenInvalidOrAlreadyUsed":     text.NewErrorValidationRecoveryTokenInvalidOrAlreadyUsed(),
 		"NewErrorValidationRecoveryCodeInvalidOrAlreadyUsed":      text.NewErrorValidationRecoveryCodeInvalidOrAlreadyUsed(),
 		"NewErrorValidationRecoveryRetrySuccess":                  text.NewErrorValidationRecoveryRetrySuccess(),
@@ -181,11 +189,27 @@ func init() {
 		"NewInfoSelfServiceLoginAAL2CodeAddress":                  text.NewInfoSelfServiceLoginAAL2CodeAddress("{channel}", "{address}"),
 		"NewErrorCaptchaFailed":                                   text.NewErrorCaptchaFailed(),
 		"NewCaptchaContainerMessage":                              text.NewCaptchaContainerMessage(),
+		"NewErrorValidationEmail":                                 text.NewErrorValidationEmail("{value}"),
+		"NewErrorValidationPhone":                                 text.NewErrorValidationPhone("{value}"),
 	}
 }
 
 func main() {
-	if err := clidoc.Generate(cmd.NewRootCmd(), []string{filepath.Join(os.Args[2], "cli")}); err != nil {
+	if os.Args[1] == "elements" {
+		path, err := filepath.Abs(os.Args[2])
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Unable to determine absolute path for elements generation: %+v", err)
+			os.Exit(1)
+		}
+
+		if err := generateElements(path); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Unable to generate locales for elements: %+v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := clidoc.Generate(cmd.NewRootCmd(nil, nil), []string{filepath.Join(os.Args[2], "cli")}); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Unable to generate CLI docs: %+v", err)
 		os.Exit(1)
 	}
@@ -243,24 +267,25 @@ func sortMessages() []*text.Message {
 }
 
 func writeMessages(path string, sortedMessages []*text.Message) error {
-	content, err := os.ReadFile(path)
+	//nolint:gosec
+	content, err := os.ReadFile(path) // #nosec
 	if err != nil {
 		return err
 	}
 
 	var w bytes.Buffer
 	for _, m := range sortedMessages {
-		w.WriteString(fmt.Sprintf(`###### %s (%d)
+		fmt.Fprintf(&w, `###### %s (%d)
 
 %s
 
-`, m.Text, m.ID, "```json\n"+codeEncode(m)+"\n```"))
+`, m.Text, m.ID, "```json\n"+codeEncode(m)+"\n```")
 	}
 
 	r := regexp.MustCompile(`(?s)<!-- START MESSAGE TABLE -->(.*?)<!-- END MESSAGE TABLE -->`)
 	result := r.ReplaceAllString(string(content), "<!-- START MESSAGE TABLE -->\n"+w.String()+"\n<!-- END MESSAGE TABLE -->")
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec
 	if err != nil {
 		return err
 	}
@@ -279,7 +304,7 @@ func writeMessages(path string, sortedMessages []*text.Message) error {
 func writeMessagesJson(path string, sortedMessages []*text.Message) error {
 	result := codeEncode(sortedMessages)
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644) // #nosec
 	if err != nil {
 		return err
 	}
@@ -371,5 +396,22 @@ func validateAllMessages(path string) error {
 		}
 	}
 
+	return nil
+}
+
+func generateElements(messageFilePath string) error {
+	// If the file at messageFilePath does not exist, create it
+	f, err := os.OpenFile(messageFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) // #nosec
+	if err != nil {
+		return errors.Wrapf(err, "unable to open or create message file at %s", messageFilePath)
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrapf(err, "unable to close message file at %s", messageFilePath)
+	}
+
+	sortedMessages := sortMessages()
+	if err := writeMessagesJson(messageFilePath, sortedMessages); err != nil {
+		return errors.Wrapf(err, "unable to write messages json to %s", messageFilePath)
+	}
 	return nil
 }

@@ -7,30 +7,24 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ory/kratos/x/nosurfx"
-	"github.com/ory/kratos/x/redir"
-
-	"github.com/ory/nosurf"
-
-	"github.com/ory/kratos/schema"
-
-	"github.com/ory/x/sqlcon"
-
-	"github.com/ory/kratos/ui/node"
-
-	"github.com/ory/herodot"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 
-	"github.com/ory/x/urlx"
-
+	"github.com/ory/herodot"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/errorx"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+	"github.com/ory/nosurf"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/urlx"
 )
 
 const (
@@ -53,7 +47,7 @@ type (
 		StrategyProvider
 		FlowPersistenceProvider
 		nosurfx.CSRFTokenGeneratorProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		nosurfx.CSRFProvider
 		config.Provider
 		ErrorHandlerProvider
@@ -64,20 +58,18 @@ type (
 	}
 )
 
-func NewHandler(d handlerDependencies) *Handler {
-	return &Handler{d: d}
-}
+func NewHandler(d handlerDependencies) *Handler { return &Handler{d: d} }
 
-func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
+func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
 	redirect := session.RedirectOnAuthenticated(h.d)
-	public.GET(RouteInitBrowserFlow, h.d.SessionHandler().IsNotAuthenticated(h.createBrowserRecoveryFlow, func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	public.GET(RouteInitBrowserFlow, h.d.SessionHandler().IsNotAuthenticated(h.createBrowserRecoveryFlow, func(w http.ResponseWriter, r *http.Request) {
 		if x.IsJSONRequest(r) {
 			h.d.Writer().WriteError(w, r, errors.WithStack(ErrAlreadyLoggedIn))
 		} else {
-			redirect(w, r, ps)
+			redirect(w, r)
 		}
 	}))
 
@@ -90,7 +82,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	public.POST(RouteSubmitFlow, h.updateRecoveryFlow)
 }
 
-func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
+func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
@@ -122,18 +114,21 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 //	  200: recoveryFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createNativeRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
 	}
-	activeRecoveryStrategy, err := h.d.GetActiveRecoveryStrategy(r.Context())
+	activeRecoveryStrategies, _, err := h.d.GetActiveRecoveryStrategies(r.Context())
 	if err != nil {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
 		return
 	}
 
-	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, activeRecoveryStrategy, flow.TypeAPI)
+	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, activeRecoveryStrategies, flow.TypeAPI)
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
@@ -187,18 +182,21 @@ type createBrowserRecoveryFlow struct {
 //	  303: emptyResponse
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createBrowserRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createBrowserRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
 	}
-	activeRecoveryStrategy, err := h.d.GetActiveRecoveryStrategy(r.Context())
+	activeRecoveryStrategies, _, err := h.d.GetActiveRecoveryStrategies(r.Context())
 	if err != nil {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
 		return
 	}
 
-	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, activeRecoveryStrategy, flow.TypeBrowser)
+	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, activeRecoveryStrategies, flow.TypeBrowser)
 	if err != nil {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
 		return
@@ -277,7 +275,10 @@ type getRecoveryFlow struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-low
+func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
@@ -402,7 +403,10 @@ type updateRecoveryFlowBody struct{}
 //	      410: errorGeneric
 //	      422: errorBrowserLocationChangeRequired
 //	      default: errorGeneric
-func (h *Handler) updateRecoveryFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-high
+func (h *Handler) updateRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
 		h.d.RecoveryFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)

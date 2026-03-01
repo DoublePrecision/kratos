@@ -4,7 +4,6 @@ SHELL=/usr/bin/env bash -o pipefail
 #  K := $(foreach exec,$(EXECUTABLES),\
 #          $(if $(shell which $(exec)),some string,$(error "No $(exec) in PATH")))
 
-export GO111MODULE        := on
 export PATH               := .bin:${PATH}
 export PWD                := $(shell pwd)
 export BUILD_DATE         := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -29,13 +28,13 @@ docs/swagger:
 	npx @redocly/openapi-cli preview-docs spec/swagger.json
 
 .bin/golangci-lint: Makefile
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -d -b .bin v1.64.8
+	curl --retry 7 --retry-connrefused -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -d -b .bin v2.10.1
 
 .bin/hydra: Makefile
-	bash <(curl https://raw.githubusercontent.com/ory/meta/master/install.sh) -d -b .bin hydra v2.2.0-rc.3
+	bash <(curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/meta/master/install.sh) -d -b .bin hydra v2.2.0-rc.3
 
 .bin/ory: Makefile
-	curl https://raw.githubusercontent.com/ory/meta/master/install.sh | bash -s -- -b .bin ory v0.2.2
+	curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/meta/master/install.sh | bash -s -- -b .bin ory v0.2.2
 	touch -a -m .bin/ory
 
 .bin/buf: Makefile
@@ -51,7 +50,7 @@ lint: .bin/golangci-lint .bin/buf
 
 .PHONY: mocks
 mocks:
-	go tool mockgen -mock_names Manager=MockLoginExecutorDependencies -package internal -destination internal/hook_login_executor_dependencies.go github.com/ory/kratos/selfservice loginExecutorDependencies
+	go tool mockgen -mock_names Manager=MockLoginExecutorDependencies -package pkg -destination pkg/hook_login_executor_dependencies.go github.com/ory/kratos/selfservice loginExecutorDependencies
 
 .PHONY: proto
 proto: gen/oidc/v1/state.pb.go
@@ -70,7 +69,7 @@ test-resetdb:
 
 .PHONY: test
 test:
-	docker pull oryd/hydra:v2.2.0@sha256:6c0f9195fe04ae16b095417b323881f8c9008837361160502e11587663b37c09
+	docker pull oryd/hydra:v2.2.0-rc.3
 	go test -p 1 -tags sqlite -count=1 -failfast ./...
 
 test-short:
@@ -112,31 +111,31 @@ sdk: .bin/ory node_modules
 			-p file://.schema/openapi/patches/common.yaml \
 			spec/swagger.json spec/api.json
 
-	rm -rf internal/httpclient
-	mkdir -p internal/httpclient/
+	rm -rf pkg/httpclient
+	mkdir -p pkg/httpclient/
 	npm run openapi-generator-cli -- generate -i "spec/api.json" \
 		-g go \
-		-o "internal/httpclient" \
+		-o "pkg/httpclient" \
 		--git-user-id ory \
 		--git-repo-id client-go \
 		--git-host github.com \
 		--api-name-suffix "API" \
 		-c .schema/openapi/gen.go.yml
 
-	(cd internal/httpclient; rm -rf go.mod go.sum test api docs)
+	(cd pkg/httpclient; rm -rf go.mod go.sum test api docs)
 
-	rm -rf internal/client-go
-	mkdir -p internal/client-go/
+	rm -rf pkg/client-go
+	mkdir -p pkg/client-go/
 	npm run openapi-generator-cli -- generate -i "spec/api.json" \
 		-g go \
-		-o "internal/client-go" \
+		-o "pkg/client-go" \
 		--git-user-id ory \
 		--git-repo-id client-go \
 		--git-host github.com \
 		--api-name-suffix "API" \
 		-c .schema/openapi/gen.go.yml
 
-	(cd internal/client-go; go mod edit -module github.com/ory/client-go go.mod; rm -rf test api docs; go mod tidy)
+	(cd pkg/client-go; go mod edit -module github.com/ory/client-go go.mod; rm -rf test api docs; go mod tidy)
 
 	make format
 
@@ -152,12 +151,12 @@ quickstart-dev:
 	docker-compose -f quickstart.yml -f quickstart-standalone.yml -f quickstart-latest.yml $(QUICKSTART_OPTIONS) up --build --force-recreate
 
 authors:  # updates the AUTHORS file
-	curl https://raw.githubusercontent.com/ory/ci/master/authors/authors.sh | env PRODUCT="Ory Kratos" bash
+	curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/ci/master/authors/authors.sh | env PRODUCT="Ory Kratos" bash
 
 # Formats the code
 .PHONY: format
 format: .bin/ory node_modules .bin/buf
-	.bin/ory dev headers copyright --exclude=gen --exclude=internal/httpclient --exclude=internal/client-go --exclude test/e2e/proxy/node_modules --exclude test/e2e/node_modules --exclude node_modules
+	.bin/ory dev headers copyright --exclude=gen --exclude=pkg/httpclient --exclude=pkg/client-go --exclude test/e2e/proxy/node_modules --exclude test/e2e/node_modules --exclude node_modules --exclude=oryx
 	go tool goimports -w -local github.com/ory .
 	npm exec -- prettier --write 'test/e2e/**/*{.ts,.js}'
 	npm exec -- prettier --write '.github'
@@ -186,17 +185,21 @@ test-e2e-playwright: node_modules test-resetdb kratos-config-e2e
 test-refresh:
 	UPDATE_SNAPSHOTS=true go test -tags sqlite,json1,refresh -short ./...
 
+.PHONY: pre-release
+pre-release:
+	go tool yq '.services.kratos.image = "oryd/kratos:'$$DOCKER_TAG'"' -i quickstart.yml
+	go tool yq '.services.kratos-migrate.image = "oryd/kratos:'$$DOCKER_TAG'"' -i quickstart.yml
+	go tool yq '.services.kratos-selfservice-ui-node.image = "oryd/kratos-selfservice-ui-node:'$$DOCKER_TAG'"' -i quickstart.yml
+
 .PHONY: post-release
 post-release:
-	cat quickstart.yml | go tool yq '.services.kratos.image = "oryd/kratos:'$$DOCKER_TAG'"' | sponge quickstart.yml
-	cat quickstart.yml | go tool yq '.services.kratos-migrate.image = "oryd/kratos:'$$DOCKER_TAG'"' | sponge quickstart.yml
-	cat quickstart.yml | go tool yq '.services.kratos-selfservice-ui-node.image = "oryd/kratos-selfservice-ui-node:'$$DOCKER_TAG'"' | sponge quickstart.yml
+	echo "nothing to do"
 
 licenses: .bin/licenses node_modules  # checks open-source licenses
 	.bin/licenses
 
 .bin/licenses: Makefile
-	curl https://raw.githubusercontent.com/ory/ci/master/licenses/install | sh
+	curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/ci/master/licenses/install | sh
 
 node_modules: package-lock.json
 	npm ci

@@ -7,29 +7,26 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ory/kratos/x/nosurfx"
-	"github.com/ory/kratos/x/redir"
-
-	"github.com/ory/kratos/hydra"
-	"github.com/ory/kratos/session"
-	"github.com/ory/nosurf"
-
-	"github.com/ory/kratos/schema"
-	"github.com/ory/kratos/ui/node"
-	"github.com/ory/x/sqlcon"
-
-	"github.com/ory/herodot"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 
-	"github.com/ory/x/urlx"
-
+	"github.com/ory/herodot"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/errorx"
 	"github.com/ory/kratos/selfservice/flow"
+	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+	"github.com/ory/nosurf"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/urlx"
 )
 
 const (
@@ -54,9 +51,9 @@ type (
 		session.ManagementProvider
 
 		nosurfx.CSRFTokenGeneratorProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		nosurfx.CSRFProvider
-		x.LoggingProvider
+		logrusx.Provider
 
 		FlowPersistenceProvider
 		ErrorHandlerProvider
@@ -68,11 +65,9 @@ type (
 	}
 )
 
-func NewHandler(d handlerDependencies) *Handler {
-	return &Handler{d: d}
-}
+func NewHandler(d handlerDependencies) *Handler { return &Handler{d: d} }
 
-func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
+func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
@@ -84,7 +79,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	public.GET(RouteSubmitFlow, h.updateVerificationFlow)
 }
 
-func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
+func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
@@ -102,12 +97,12 @@ func WithFlowReturnTo(returnTo string) FlowOption {
 }
 
 func (h *Handler) NewVerificationFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, error) {
-	strategy, err := h.d.GetActiveVerificationStrategy(r.Context())
+	strategies, _, err := h.d.GetActiveVerificationStrategies(r.Context())
 	if err != nil {
 		return nil, err
 	}
 
-	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowVerificationRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, strategy, ft)
+	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowVerificationRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, strategies, ft)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +157,10 @@ type createNativeVerificationFlow struct {
 //	  200: verificationFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createNativeVerificationFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
@@ -209,7 +207,10 @@ type createBrowserVerificationFlow struct {
 //	  200: verificationFlow
 //	  303: emptyResponse
 //	  default: errorGeneric
-func (h *Handler) createBrowserVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createBrowserVerificationFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
@@ -284,7 +285,10 @@ type getVerificationFlow struct {
 //	  403: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-low
+func (h *Handler) getVerificationFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowVerificationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Verification is not allowed because it was disabled.")))
 		return
@@ -408,7 +412,10 @@ type updateVerificationFlowBody struct{}
 //	  400: verificationFlow
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) updateVerificationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-high
+func (h *Handler) updateVerificationFlow(w http.ResponseWriter, r *http.Request) {
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
 		h.d.VerificationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
@@ -433,8 +440,8 @@ func (h *Handler) updateVerificationFlow(w http.ResponseWriter, r *http.Request,
 	var g node.UiNodeGroup
 	var found bool
 	for _, ss := range h.d.AllVerificationStrategies() {
-		// If an active strategy is set, but it does not match the current strategy, that strategy is not responsible anyways.
-		if f.Active.String() != "" && f.Active.String() != ss.VerificationStrategyID() {
+		// If a primary strategy is set, but it does not match the current strategy, that strategy is not responsible anyways.
+		if ps, isPrimary := ss.(PrimaryStrategy); isPrimary && f.Active.String() != "" && f.Active.String() != ps.VerificationStrategyID() {
 			continue
 		}
 

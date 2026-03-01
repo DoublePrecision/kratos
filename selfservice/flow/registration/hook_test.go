@@ -15,7 +15,7 @@ import (
 
 	"github.com/gobuffalo/httptest"
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -23,8 +23,8 @@ import (
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/selfservice/hook"
@@ -41,16 +41,16 @@ func TestRegistrationExecutor(t *testing.T) {
 		t.Run("strategy="+strategy, func(t *testing.T) {
 			t.Parallel()
 
-			conf, reg := internal.NewFastRegistryWithMocks(t)
-			reg.WithHydra(hydra.NewFake())
+			conf, reg := pkg.NewFastRegistryWithMocks(t)
+			reg.SetHydra(hydra.NewFake())
 			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
 			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
 
 			newServer := func(t *testing.T, i *identity.Identity, ft flow.Type, flowCallbacks ...func(*registration.Flow)) *httptest.Server {
-				router := httprouter.New()
+				router := http.NewServeMux()
 
 				handleErr := testhelpers.SelfServiceHookRegistrationErrorHandler
-				router.GET("/registration/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /registration/pre", func(w http.ResponseWriter, r *http.Request) {
 					f, err := registration.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, ft)
 					require.NoError(t, err)
 					if handleErr(t, w, r, reg.RegistrationHookExecutor().PreRegistrationHook(w, r, f)) {
@@ -58,7 +58,7 @@ func TestRegistrationExecutor(t *testing.T) {
 					}
 				})
 
-				router.GET("/registration/post", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /registration/post", func(w http.ResponseWriter, r *http.Request) {
 					if i == nil {
 						i = testhelpers.SelfServiceHookFakeIdentity(t)
 					}

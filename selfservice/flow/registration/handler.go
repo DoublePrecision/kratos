@@ -8,10 +8,6 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ory/kratos/x/nosurfx"
-	"github.com/ory/kratos/x/redir"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -30,7 +26,12 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/events"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
@@ -52,7 +53,7 @@ type (
 		hydra.Provider
 		session.HandlerProvider
 		session.ManagementProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		nosurfx.CSRFTokenGeneratorProvider
 		nosurfx.CSRFProvider
 		StrategyProvider
@@ -60,7 +61,7 @@ type (
 		FlowPersistenceProvider
 		ErrorHandlerProvider
 		sessiontokenexchange.PersistenceProvider
-		x.LoggingProvider
+		logrusx.Provider
 	}
 	HandlerProvider interface {
 		RegistrationHandler() *Handler
@@ -70,11 +71,9 @@ type (
 	}
 )
 
-func NewHandler(d handlerDependencies) *Handler {
-	return &Handler{d: d}
-}
+func NewHandler(d handlerDependencies) *Handler { return &Handler{d: d} }
 
-func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
+func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
@@ -88,16 +87,16 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	public.GET(RouteSubmitFlow, h.d.SessionHandler().IsNotAuthenticated(h.updateRegistrationFlow, h.onAuthenticated))
 }
 
-func (h *Handler) onAuthenticated(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) onAuthenticated(w http.ResponseWriter, r *http.Request) {
 	handler := session.RedirectOnAuthenticated(h.d)
 	if x.IsJSONRequest(r) {
 		handler = session.RespondWithJSONErrorOnAuthenticated(h.d.Writer(), ErrAlreadyLoggedIn)
 	}
 
-	handler(w, r, ps)
+	handler(w, r)
 }
 
-func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
+func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
@@ -161,7 +160,7 @@ func (h *Handler) NewRegistrationFlow(w http.ResponseWriter, r *http.Request, ft
 		}
 	}
 
-	ds, err := h.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), h.d.Config())
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +190,7 @@ func (h *Handler) FromOldFlow(w http.ResponseWriter, r *http.Request, of Flow) (
 	}
 
 	nf.RequestURL = of.RequestURL
+	nf.IdentitySchema = of.IdentitySchema
 	return nf, nil
 }
 
@@ -224,7 +224,10 @@ func (h *Handler) FromOldFlow(w http.ResponseWriter, r *http.Request, of Flow) (
 //	  200: registrationFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeRegistrationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createNativeRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	a, err := h.NewRegistrationFlow(w, r, flow.TypeAPI)
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
@@ -258,6 +261,12 @@ type createNativeRegistrationFlow struct {
 	// required: false
 	// in: query
 	Organization string `json:"organization"`
+
+	// An optional identity schema to use for the registration flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // Create Browser Registration Flow Parameters
@@ -301,6 +310,12 @@ type createBrowserRegistrationFlow struct {
 	// required: false
 	// in: query
 	Organization string `json:"organization"`
+
+	// An optional identity schema to use for the registration flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // swagger:route GET /self-service/registration/browser frontend createBrowserRegistrationFlow
@@ -336,7 +351,10 @@ type createBrowserRegistrationFlow struct {
 //	  200: registrationFlow
 //	  303: emptyResponse
 //	  default: errorGeneric
-func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	a, err := h.NewRegistrationFlow(w, r, flow.TypeBrowser)
@@ -501,7 +519,10 @@ type getRegistrationFlow struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-low
+func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(ErrRegistrationDisabled))
 		return
@@ -638,20 +659,26 @@ type updateRegistrationFlowBody struct{}
 //	  410: errorGeneric
 //	  422: errorBrowserLocationChangeRequired
 //	  default: errorGeneric
-func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-high
+func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = semconv.ContextWithAttributes(ctx, attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "registration"))
+	ctx = semconv.ContextWithAttributes(ctx,
+		attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "registration"),
+		attribute.String(events.AttributeKeySelfServiceFlowName.String(), "registration"),
+	)
 	r = r.WithContext(ctx)
 
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
-		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
+		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, nil, "", node.DefaultGroup, err)
 		return
 	}
 
 	f, err := h.d.RegistrationFlowPersister().GetRegistrationFlow(r.Context(), rid)
 	if err != nil {
-		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
+		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, nil, "", node.DefaultGroup, err)
 		return
 	}
 
@@ -666,11 +693,11 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request,
 	}
 
 	if err := f.Valid(); err != nil {
-		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}
 
-	i := identity.NewIdentity(h.d.Config().DefaultIdentityTraitsSchemaID(r.Context()))
+	i := identity.NewIdentity(f.IdentitySchema.ID(ctx, h.d.Config()))
 	var s Strategy
 	for _, ss := range h.d.AllRegistrationStrategies() {
 		if err := ss.Register(w, r, f, i); errors.Is(err, flow.ErrStrategyNotResponsible) {
@@ -678,7 +705,7 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request,
 		} else if errors.Is(err, flow.ErrCompletedByStrategy) {
 			return
 		} else if err != nil {
-			h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, ss.NodeGroup(), err)
+			h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, ss.ID(), ss.NodeGroup(), err)
 			return
 		}
 
@@ -687,12 +714,12 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request,
 	}
 
 	if s == nil {
-		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, errors.WithStack(schema.NewNoRegistrationStrategyResponsible()))
+		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, errors.WithStack(schema.NewNoRegistrationStrategyResponsible()))
 		return
 	}
 
 	if err := h.d.RegistrationExecutor().PostRegistrationHook(w, r, s.ID(), "", "", f, i); err != nil {
-		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, s.NodeGroup(), err)
+		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, s.ID(), s.NodeGroup(), err)
 		return
 	}
 }

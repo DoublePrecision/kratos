@@ -6,7 +6,6 @@ package driver_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,9 +17,8 @@ import (
 
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/request"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flow/recovery"
@@ -34,11 +32,10 @@ func TestDriverDefault_Hooks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
-
 	t.Run("type=verification", func(t *testing.T) {
 		t.Parallel()
 		// BEFORE hooks
+		_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 		for _, tc := range []struct {
 			uc     string
 			config map[string]any
@@ -69,7 +66,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
 				h, err := reg.PreVerificationHooks(ctx)
 				require.NoError(t, err)
@@ -111,7 +108,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
 				h, err := reg.PostVerificationHooks(ctx)
 				require.NoError(t, err)
@@ -152,8 +149,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PreRecoveryHooks(ctx)
 				require.NoError(t, err)
 
@@ -190,8 +188,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PostRecoveryHooks(ctx)
 				require.NoError(t, err)
 
@@ -233,8 +232,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PreRegistrationHooks(ctx)
 				require.NoError(t, err)
 
@@ -338,8 +338,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PostRegistrationPostPersistHooks(ctx, identity.CredentialsTypePassword)
 				require.NoError(t, err)
 
@@ -379,8 +380,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PreLoginHooks(ctx)
 				require.NoError(t, err)
 
@@ -480,8 +482,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PostLoginHooks(ctx, identity.CredentialsTypePassword)
 				require.NoError(t, err)
 
@@ -521,8 +524,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PreSettingsHooks(ctx)
 				require.NoError(t, err)
 
@@ -608,8 +612,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				h, err := reg.PostSettingsPostPersistHooks(ctx, "profile")
 				require.NoError(t, err)
 
@@ -622,7 +627,6 @@ func TestDriverDefault_Hooks(t *testing.T) {
 func TestDriverDefault_Strategies(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
 
 	t.Run("case=registration", func(t *testing.T) {
 		t.Parallel()
@@ -678,7 +682,8 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			t.Run(fmt.Sprintf("subcase=%s", tc.name), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				s := reg.RegistrationStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
 				for k, e := range tc.expect {
@@ -751,7 +756,8 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			t.Run(fmt.Sprintf("run=%s", tc.name), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				s := reg.LoginStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
 				for k, e := range tc.expect {
@@ -783,8 +789,9 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			t.Run(fmt.Sprintf("run=%d", k), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
+				_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				s := reg.RecoveryStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
 				for k, e := range tc.expect {
@@ -842,7 +849,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("run=%d", k), func(t *testing.T) {
-				conf := config.MustNew(t, l, os.Stderr, &contextx.Default{}, append(tc.configOptions, configx.SkipValidation())...)
+				conf := config.MustNew(t, l, &contextx.Default{}, append(tc.configOptions, configx.SkipValidation())...)
 
 				reg, err := driver.NewRegistryFromDSN(ctx, conf, l)
 				require.NoError(t, err)
@@ -860,7 +867,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 
 func TestDefaultRegistry_AllStrategies(t *testing.T) {
 	t.Parallel()
-	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 
 	t.Run("case=all login strategies", func(t *testing.T) {
 		expects := []string{"password", "oidc", "code", "totp", "passkey", "webauthn", "lookup_secret", "identifier_first"}
@@ -902,31 +909,32 @@ func TestDefaultRegistry_AllStrategies(t *testing.T) {
 func TestGetActiveRecoveryStrategy(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 
 	t.Run("returns error if active strategy is disabled", func(t *testing.T) {
-		ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+		ctx := contextx.WithConfigValues(ctx, map[string]any{
 			"selfservice.methods.code.enabled":    false,
 			config.ViperKeySelfServiceRecoveryUse: "code",
 		})
 
-		_, err := reg.GetActiveRecoveryStrategy(ctx)
+		_, _, err := reg.GetActiveRecoveryStrategies(ctx)
 		require.Error(t, err)
 	})
 
-	t.Run("returns active strategy", func(t *testing.T) {
+	t.Run("returns active strategies", func(t *testing.T) {
 		for _, sID := range []string{
 			"code", "link",
 		} {
 			t.Run(fmt.Sprintf("strategy=%s", sID), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+				ctx := contextx.WithConfigValues(ctx, map[string]any{
 					fmt.Sprintf("selfservice.methods.%s.enabled", sID): true,
 					config.ViperKeySelfServiceRecoveryUse:              sID,
 				})
 
-				s, err := reg.GetActiveRecoveryStrategy(ctx)
+				s, ps, err := reg.GetActiveRecoveryStrategies(ctx)
 				require.NoError(t, err)
-				require.Equal(t, sID, s.RecoveryStrategyID())
+				require.Len(t, s, 1)
+				require.Equal(t, sID, ps.RecoveryStrategyID())
 			})
 		}
 	})
@@ -935,13 +943,13 @@ func TestGetActiveRecoveryStrategy(t *testing.T) {
 func TestGetActiveVerificationStrategy(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 	t.Run("returns error if active strategy is disabled", func(t *testing.T) {
-		ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+		ctx := contextx.WithConfigValues(ctx, map[string]any{
 			"selfservice.methods.code.enabled":        false,
 			config.ViperKeySelfServiceVerificationUse: "code",
 		})
-		_, err := reg.GetActiveVerificationStrategy(ctx)
+		_, _, err := reg.GetActiveVerificationStrategies(ctx)
 		require.Error(t, err)
 	})
 
@@ -950,12 +958,12 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 			"code", "link",
 		} {
 			t.Run(fmt.Sprintf("strategy=%s", sID), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+				ctx := contextx.WithConfigValues(ctx, map[string]any{
 					fmt.Sprintf("selfservice.methods.%s.enabled", sID): true,
 					config.ViperKeySelfServiceVerificationUse:          sID,
 				})
 
-				s, err := reg.GetActiveVerificationStrategy(ctx)
+				_, s, err := reg.GetActiveVerificationStrategies(ctx)
 				require.NoError(t, err)
 				require.Equal(t, sID, s.VerificationStrategyID())
 			})

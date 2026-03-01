@@ -21,6 +21,7 @@ import (
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/continuity"
+	oidcv1 "github.com/ory/kratos/gen/oidc/v1"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
@@ -34,8 +35,10 @@ import (
 	"github.com/ory/x/sqlxx"
 )
 
-var _ registration.Strategy = new(Strategy)
-var _ registration.FormHydrator = new(Strategy)
+var (
+	_ registration.Strategy     = (*Strategy)(nil)
+	_ registration.FormHydrator = (*Strategy)(nil)
+)
 
 var jsonnetCache, _ = ristretto.NewCache(&ristretto.Config[[]byte, []byte]{
 	MaxCost:     100 << 20, // 100MB,
@@ -46,8 +49,8 @@ var jsonnetCache, _ = ristretto.NewCache(&ristretto.Config[[]byte, []byte]{
 type MetadataType string
 
 type VerifiedAddress struct {
-	Value string                         `json:"value"`
-	Via   identity.VerifiableAddressType `json:"via"`
+	Value string `json:"value"`
+	Via   string `json:"via"`
 }
 
 const (
@@ -56,10 +59,6 @@ const (
 	PublicMetadata MetadataType = "identity.metadata_public"
 	AdminMetadata  MetadataType = "identity.metadata_admin"
 )
-
-func (s *Strategy) RegisterRegistrationRoutes(r *x.RouterPublic) {
-	s.setRoutes(r)
-}
 
 func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) error {
 	return s.populateMethod(r, f, text.NewInfoRegistrationWith)
@@ -131,8 +130,8 @@ type UpdateRegistrationFlowWithOidcMethod struct {
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
 }
 
-func (s *Strategy) newLinkDecoder(ctx context.Context, p interface{}, r *http.Request) error {
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(ctx)
+func (s *Strategy) newLinkDecoder(ctx context.Context, p interface{}, r *http.Request, identitySchema *flow.IdentitySchema) error {
+	ds, err := identitySchema.URL(ctx, s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -147,7 +146,7 @@ func (s *Strategy) newLinkDecoder(ctx context.Context, p interface{}, r *http.Re
 		return errors.WithStack(err)
 	}
 
-	if err := s.dec.Decode(r, &p, compiler,
+	if err := decoderx.Decode(r, &p, compiler,
 		decoderx.HTTPKeepRequestBody(true),
 		decoderx.HTTPDecoderSetValidatePayloads(false),
 		decoderx.HTTPDecoderUseQueryAndBody(),
@@ -165,7 +164,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 	defer otelx.End(span, &err)
 
 	var p UpdateRegistrationFlowWithOidcMethod
-	if err := s.newLinkDecoder(ctx, &p, r); err != nil {
+	if err := s.newLinkDecoder(ctx, &p, r, &f.IdentitySchema); err != nil {
 		return s.HandleError(ctx, w, r, f, "", nil, err)
 	}
 
@@ -181,7 +180,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 
 	if !strings.EqualFold(strings.ToLower(p.Method), s.SettingsStrategyID()) && p.Method != "" {
 		// the user is sending a method that is not oidc, but the payload includes a provider
-		s.d.Audit().
+		s.d.Logger().
 			WithRequest(r).
 			WithField("provider", p.Provider).
 			WithField("method", p.Method).
@@ -199,7 +198,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
 
-	req, err := s.validateFlow(ctx, r, f.ID)
+	req, err := s.validateFlow(ctx, r, f.ID, oidcv1.FlowKind_FLOW_KIND_REGISTRATION)
 	if err != nil {
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
@@ -219,14 +218,17 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 			FlowID:           f.ID.String(),
 			Traits:           p.Traits,
 			TransientPayload: f.TransientPayload,
+			IdentitySchema:   f.IdentitySchema,
 		})
-		if err != nil {
+		if errors.Is(err, flow.ErrCompletedByStrategy) {
+			return err
+		} else if err != nil {
 			return s.HandleError(ctx, w, r, f, pid, nil, err)
 		}
 		return errors.WithStack(flow.ErrCompletedByStrategy)
 	}
 
-	state, pkce, err := s.GenerateState(ctx, provider, f.ID)
+	state, pkce, err := s.GenerateState(ctx, provider, f)
 	if err != nil {
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
@@ -236,6 +238,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 			FlowID:           f.ID.String(),
 			Traits:           p.Traits,
 			TransientPayload: f.TransientPayload,
+			IdentitySchema:   f.IdentitySchema,
 		}),
 		continuity.WithLifespan(time.Minute*30)); err != nil {
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
@@ -271,6 +274,9 @@ func (s *Strategy) registrationToLogin(ctx context.Context, w http.ResponseWrite
 	}
 
 	opts = append(opts, login.WithInternalContext(rf.InternalContext), login.WithIsAccountLinking())
+	if rf.OAuth2LoginChallenge != "" {
+		opts = append(opts, login.WithLoginChallenge(rf.OAuth2LoginChallenge.String()))
+	}
 
 	lf, _, err := s.d.LoginHandler().NewLoginFlow(w, r, rf.Type, opts...)
 	if err != nil {
@@ -291,6 +297,7 @@ func (s *Strategy) registrationToLogin(ctx context.Context, w http.ResponseWrite
 	lf.TransientPayload = rf.TransientPayload
 	lf.Active = s.ID()
 	lf.OrganizationID = rf.OrganizationID
+	lf.IdentitySchema = rf.IdentitySchema
 
 	return lf, nil
 }
@@ -325,7 +332,7 @@ func (s *Strategy) processRegistration(ctx context.Context, w http.ResponseWrite
 		return nil, nil
 	}
 
-	i, va, err := s.newIdentityFromClaims(ctx, claims, provider, container)
+	i, va, err := s.newIdentityFromClaims(ctx, claims, provider, container, rf.IdentitySchema)
 	if err != nil {
 		return nil, s.HandleError(ctx, w, r, rf, provider.Config().ID, nil, err)
 	}
@@ -360,7 +367,7 @@ func (s *Strategy) processRegistration(ctx context.Context, w http.ResponseWrite
 	return nil, nil
 }
 
-func (s *Strategy) newIdentityFromClaims(ctx context.Context, claims *Claims, provider Provider, container *AuthCodeContainer) (_ *identity.Identity, _ []VerifiedAddress, err error) {
+func (s *Strategy) newIdentityFromClaims(ctx context.Context, claims *Claims, provider Provider, container *AuthCodeContainer, schema flow.IdentitySchema) (_ *identity.Identity, _ []VerifiedAddress, err error) {
 	fetch := fetcher.NewFetcher(fetcher.WithClient(s.d.HTTPClient(ctx)), fetcher.WithCache(jsonnetCache, 60*time.Minute))
 	jsonnetSnippet, err := fetch.FetchContext(ctx, provider.Config().Mapper)
 	if err != nil {
@@ -376,7 +383,7 @@ func (s *Strategy) newIdentityFromClaims(ctx context.Context, claims *Claims, pr
 	defer func() {
 		if err != nil {
 			trace.SpanFromContext(ctx).AddEvent(events.NewJsonnetMappingFailed(
-				ctx, err, jsonClaims.Bytes(), evaluated, provider.Config().Provider, s.ID(),
+				ctx, err, jsonClaims.Bytes(), evaluated, provider.Config().Provider, s.ID().String(),
 			))
 		}
 	}()
@@ -392,7 +399,7 @@ func (s *Strategy) newIdentityFromClaims(ctx context.Context, claims *Claims, pr
 		return nil, nil, err
 	}
 
-	i := identity.NewIdentity(s.d.Config().DefaultIdentityTraitsSchemaID(ctx))
+	i := identity.NewIdentity(schema.ID(ctx, s.d.Config()))
 	if err = s.setTraits(provider, container, evaluated, i); err != nil {
 		return nil, nil, err
 	}
@@ -455,7 +462,7 @@ func (s *Strategy) setMetadata(evaluated string, i *identity.Identity, m Metadat
 
 	metadata := gjson.Get(evaluated, string(m))
 	if metadata.Exists() && !metadata.IsObject() {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("OpenID Connect Jsonnet mapper did not return an object for key %s. Please check your Jsonnet code!", m))
+		return errors.WithStack(herodot.ErrMisconfiguration.WithReasonf("OpenID Connect Jsonnet mapper did not return an object for key %s. Please check your Jsonnet code!", m))
 	}
 
 	switch m {
@@ -481,7 +488,7 @@ func (s *Strategy) extractVerifiedAddresses(evaluated string) ([]VerifiedAddress
 
 		for i := range va {
 			va := &va[i]
-			if va.Via == identity.VerifiableAddressTypeEmail {
+			if va.Via == identity.AddressTypeEmail {
 				va.Value = strings.ToLower(strings.TrimSpace(va.Value))
 			}
 		}

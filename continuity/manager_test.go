@@ -5,7 +5,6 @@ package continuity_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,24 +13,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/driver/config"
-
-	"github.com/ory/kratos/internal/testhelpers"
-
-	"github.com/ory/x/ioutilx"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/herodot"
-	"github.com/ory/x/logrusx"
-
 	"github.com/ory/kratos/continuity"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/ioutilx"
+	"github.com/ory/x/logrusx"
 )
 
 type persisterTestCase struct {
@@ -46,32 +40,31 @@ type persisterTestPayload struct {
 }
 
 func TestManager(t *testing.T) {
-	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://../test/stub/identity/empty.schema.json")),
+	)
 
-	testhelpers.SetDefaultIdentitySchema(conf, "file://../test/stub/identity/empty.schema.json")
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "https://www.ory.sh")
 	i := identity.NewIdentity("")
-	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(t.Context(), i))
 
 	newServer := func(t *testing.T, p continuity.Manager, tc *persisterTestCase) *httptest.Server {
 		writer := herodot.NewJSONWriter(logrusx.New("", ""))
-		router := httprouter.New()
-		router.PUT("/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-			if err := p.Pause(r.Context(), w, r, ps.ByName("name"), tc.ro...); err != nil {
+		router := http.NewServeMux()
+		router.HandleFunc("PUT /{name}", func(w http.ResponseWriter, r *http.Request) {
+			if err := p.Pause(r.Context(), w, r, r.PathValue("name"), tc.ro...); err != nil {
 				writer.WriteError(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		})
 
-		router.POST("/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-			if err := p.Pause(r.Context(), w, r, ps.ByName("name"), tc.ro...); err != nil {
+		router.HandleFunc("POST /{name}", func(w http.ResponseWriter, r *http.Request) {
+			if err := p.Pause(r.Context(), w, r, r.PathValue("name"), tc.ro...); err != nil {
 				writer.WriteError(w, r, err)
 				return
 			}
 
-			c, err := p.Continue(r.Context(), w, r, ps.ByName("name"), tc.wo...)
+			c, err := p.Continue(r.Context(), w, r, r.PathValue("name"), tc.wo...)
 			if err != nil {
 				writer.WriteError(w, r, err)
 				return
@@ -79,8 +72,8 @@ func TestManager(t *testing.T) {
 			writer.Write(w, r, c)
 		})
 
-		router.GET("/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-			c, err := p.Continue(r.Context(), w, r, ps.ByName("name"), tc.ro...)
+		router.HandleFunc("GET /{name}", func(w http.ResponseWriter, r *http.Request) {
+			c, err := p.Continue(r.Context(), w, r, r.PathValue("name"), tc.ro...)
 			if err != nil {
 				writer.WriteError(w, r, err)
 				return
@@ -88,8 +81,8 @@ func TestManager(t *testing.T) {
 			writer.Write(w, r, c)
 		})
 
-		router.DELETE("/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-			err := p.Abort(r.Context(), w, r, ps.ByName("name"))
+		router.HandleFunc("DELETE /{name}", func(w http.ResponseWriter, r *http.Request) {
+			err := p.Abort(r.Context(), w, r, r.PathValue("name"))
 			if err != nil {
 				writer.WriteError(w, r, err)
 				return
@@ -98,9 +91,7 @@ func TestManager(t *testing.T) {
 		})
 
 		ts := httptest.NewServer(router)
-		t.Cleanup(func() {
-			ts.Close()
-		})
+		t.Cleanup(ts.Close)
 		return ts
 	}
 

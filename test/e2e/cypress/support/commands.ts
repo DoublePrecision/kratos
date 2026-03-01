@@ -918,12 +918,12 @@ Cypress.Commands.add("loginMobile", ({ email, password }) => {
 })
 
 Cypress.Commands.add("logout", () => {
-  cy.getCookies({domain: "localhost"}).then((cookies) => {
+  cy.getCookies({ domain: "localhost" }).then((cookies) => {
     const c = cookies.find(
       ({ name }) => name.indexOf("ory_kratos_session") > -1,
     )
     if (c) {
-      cy.clearCookie(c.name, {domain: "localhost"})
+      cy.clearCookie(c.name, { domain: "localhost" })
     }
   })
   cy.noSession()
@@ -1131,7 +1131,7 @@ Cypress.Commands.add(
       }
 
       if (redirectTo) {
-        cy.get(`[data-testid="node/anchor/continue"`)
+        cy.get(`[data-testid="node/anchor/continue"]`)
           .contains("Continue")
           .click()
         cy.url().should("be.equal", redirectTo)

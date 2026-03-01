@@ -14,43 +14,33 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/x/nosurfx"
-
-	"github.com/julienschmidt/httprouter"
-	"github.com/pkg/errors"
-
-	"github.com/ory/x/urlx"
-
-	"github.com/ory/x/sqlxx"
-
-	stdtotp "github.com/pquerna/otp/totp"
-
-	"github.com/ory/kratos/hydra"
-	"github.com/ory/kratos/selfservice/flow"
-	"github.com/ory/kratos/selfservice/strategy/totp"
-
-	"github.com/ory/kratos/ui/container"
-
-	"github.com/ory/kratos/text"
-
 	"github.com/gobuffalo/httptest"
 	"github.com/gofrs/uuid"
-
-	"github.com/ory/kratos/corpx"
-
+	"github.com/pkg/errors"
+	stdtotp "github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/ory/x/assertx"
+	"github.com/ory/x/httprouterx"
 
+	"github.com/ory/kratos/corpx"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flow/settings"
+	"github.com/ory/kratos/selfservice/strategy/totp"
+	"github.com/ory/kratos/text"
+	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/sqlxx"
+	"github.com/ory/x/urlx"
 )
 
 func init() {
@@ -59,16 +49,25 @@ func init() {
 
 func TestFlowLifecycle(t *testing.T) {
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	reg.WithHydra(hydra.NewFake())
-	router := x.NewRouterPublic()
-	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
+	fakeHydra := hydra.NewFake()
+	reg.SetHydra(fakeHydra)
+
+	routerPublic := httprouterx.NewTestRouterPublic(t)
+	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, routerPublic, httprouterx.NewTestRouterAdminWithPrefix(t))
 	loginTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
 
+	returnToTS := testhelpers.NewRedirTS(t, "return_to", conf)
 	errorTS := testhelpers.NewErrorTestServer(t, reg)
-	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
+	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToTS.URL)
 
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/password.schema.json")
+	conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+		{ID: "default", URL: "file://./stub/password.schema.json"},
+		{ID: "email", URL: "file://./stub/email.schema.json", SelfserviceSelectable: true},
+		{ID: "phone", URL: "file://./stub/phone.schema.json", SelfserviceSelectable: true},
+		{ID: "not-allowed", URL: "file://./stub/password.schema.json"},
+	})
+	conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "default")
 
 	assertion := func(body []byte, isForced, isApi bool) {
 		r := gjson.GetBytes(body, "refresh")
@@ -88,7 +87,7 @@ func TestFlowLifecycle(t *testing.T) {
 		}
 		req := testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+route, nil)
 		req.URL.RawQuery = extQuery.Encode()
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, req)
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, routerPublic, req)
 		if isAPI {
 			assert.Len(t, res.Header.Get("Set-Cookie"), 0)
 		}
@@ -127,7 +126,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 		res, err := c.Do(req)
 		require.NoError(t, err)
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res, body
@@ -215,7 +214,7 @@ func TestFlowLifecycle(t *testing.T) {
 			t.Run("case=reset the session when refresh is true but identity is different", func(t *testing.T) {
 				testhelpers.NewRedirSessionEchoTS(t, reg)
 				t.Cleanup(func() {
-					conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
+					conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToTS.URL)
 				})
 
 				run := func(t *testing.T, tt flow.Type) (string, string) {
@@ -276,7 +275,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 			t.Run("case=changed kratos session identifiers when refresh is true", func(t *testing.T) {
 				t.Cleanup(func() {
-					conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
+					conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToTS.URL)
 				})
 
 				t.Run("type=browser", func(t *testing.T) {
@@ -354,7 +353,7 @@ func TestFlowLifecycle(t *testing.T) {
 				require.NoError(t, err)
 				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-				body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, req)
+				body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, routerPublic, req)
 				return string(body), res
 			}
 
@@ -366,7 +365,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 			t.Run("type=browser", func(t *testing.T) {
 				_, res := run(t, flow.TypeBrowser, url.Values{"method": {"password"}})
-				assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+				assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 			})
 		})
 
@@ -426,7 +425,7 @@ func TestFlowLifecycle(t *testing.T) {
 			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsRequiredAAL, config.HighestAvailableAAL)
 			conf.MustSet(ctx, config.ViperKeySessionWhoAmIAAL, config.HighestAvailableAAL)
 			testhelpers.StrategyEnable(t, conf, identity.CredentialsTypeTOTP.String(), true)
-			conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/"})
+			conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnToTS.URL})
 
 			t.Cleanup(func() {
 				conf.MustSet(ctx, config.ViperKeySelfServiceSettingsRequiredAAL, string(identity.AuthenticatorAssuranceLevel1))
@@ -458,7 +457,7 @@ func TestFlowLifecycle(t *testing.T) {
 			})
 			require.NoError(t, reg.IdentityManager().Update(context.Background(), id, identity.ManagerAllowWriteProtectedTraits))
 
-			h := func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+			h := func(w http.ResponseWriter, r *http.Request) {
 				sess, err := testhelpers.NewActiveSession(r, reg, id, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 				require.NoError(t, err)
 				sess.AuthenticatorAssuranceLevel = identity.AuthenticatorAssuranceLevel1
@@ -467,13 +466,13 @@ func TestFlowLifecycle(t *testing.T) {
 				require.Equal(t, identity.AuthenticatorAssuranceLevel1, sess.AuthenticatorAssuranceLevel)
 			}
 
-			router.GET("/mock-session", h)
+			routerPublic.GET("/mock-session", h)
 
 			client := testhelpers.NewClientWithCookies(t)
 
 			testhelpers.MockHydrateCookieClient(t, client, ts.URL+"/mock-session")
 
-			settingsURL := ts.URL + settings.RouteInitBrowserFlow + "?return_to=https://www.ory.sh"
+			settingsURL := ts.URL + settings.RouteInitBrowserFlow + "?return_to=" + url.QueryEscape(returnToTS.URL)
 			req, err := http.NewRequest("GET", settingsURL, nil)
 			require.NoError(t, err)
 
@@ -507,7 +506,7 @@ func TestFlowLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			body := string(x.MustReadAll(resp.Body))
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			totpNode := gjson.Get(body, "ui.nodes.#(attributes.name==totp_code)").String()
 			require.NotEmpty(t, totpNode)
@@ -539,6 +538,56 @@ func TestFlowLifecycle(t *testing.T) {
 	})
 
 	t.Run("lifecycle=init", func(t *testing.T) {
+		t.Run("suite=identity schema in query", func(t *testing.T) {
+			for _, tc := range []struct {
+				name           string
+				query          url.Values
+				wantErr        bool
+				wantIdentifier string
+			}{{
+				name:    "not-allowed",
+				query:   url.Values{"identity_schema": {"not-allowed"}},
+				wantErr: true,
+			}, {
+				name:    "not-found",
+				query:   url.Values{"identity_schema": {"not-found"}},
+				wantErr: true,
+			}, {
+				name:           "phone",
+				query:          url.Values{"identity_schema": {"phone"}},
+				wantIdentifier: "Phone Number",
+			}, {
+				name:           "email",
+				query:          url.Values{"identity_schema": {"email"}},
+				wantIdentifier: "E-Mail Address",
+			}, {
+				name:           "default",
+				query:          url.Values{"identity_schema": {"default"}},
+				wantIdentifier: "Username",
+			}} {
+				t.Run("case="+tc.name, func(t *testing.T) {
+					t.Run("flow=api", func(t *testing.T) {
+						res, body := initFlow(t, tc.query, true)
+						if tc.wantErr {
+							assert.Equal(t, http.StatusBadRequest, res.StatusCode)
+							return
+						}
+						assert.Equalf(t, tc.wantIdentifier, gjson.GetBytes(body, "ui.nodes.#(attributes.name==identifier).meta.label.text").String(), "%s", body)
+					})
+
+					t.Run("flow=browser", func(t *testing.T) {
+						res, body := initFlow(t, tc.query, false)
+						if tc.wantErr {
+							require.Contains(t, res.Request.URL.String(), errorTS.URL, "%s", body)
+							assert.EqualValues(t, "Bad Request", gjson.GetBytes(body, "status").String(), "%s", body)
+							return
+						}
+						assert.Equalf(t, tc.wantIdentifier, gjson.GetBytes(body, "ui.nodes.#(attributes.name==identifier).meta.label.context.title").String(), "%s", body)
+					})
+				})
+			}
+		})
+
 		t.Run("flow=api", func(t *testing.T) {
 			t.Run("case=does not set forced flag on unauthenticated request", func(t *testing.T) {
 				res, body := initFlow(t, url.Values{}, true)
@@ -548,7 +597,7 @@ func TestFlowLifecycle(t *testing.T) {
 			})
 
 			t.Run("case=returns session exchange code with any truthy value", func(t *testing.T) {
-				conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh", "https://example.com"})
+				conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnToTS.URL, "https://example.com"})
 				parameters := []string{"true", "True", "1"}
 
 				for _, param := range parameters {
@@ -661,7 +710,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 			t.Run("case=redirects if aal2 is requested and set up already without refresh", func(t *testing.T) {
 				res, _ := initAuthenticatedFlow(t, url.Values{"aal": {"aal2"}, "set_aal": {"aal2"}}, false)
-				assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+				assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 			})
 
 			t.Run("case=can not request aal2 on unauthenticated request", func(t *testing.T) {
@@ -672,7 +721,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 			t.Run("case=ignores aal1 if session has aal1 already", func(t *testing.T) {
 				res, _ := initAuthenticatedFlow(t, url.Values{"aal": {"aal1"}}, false)
-				assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+				assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 			})
 
 			t.Run("case=aal0 is not a valid value", func(t *testing.T) {
@@ -701,12 +750,12 @@ func TestFlowLifecycle(t *testing.T) {
 
 			t.Run("case=does not set forced flag on authenticated request without refresh=true", func(t *testing.T) {
 				res, _ := initAuthenticatedFlow(t, url.Values{}, false)
-				assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+				assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 			})
 
 			t.Run("case=does not set forced flag on authenticated request with refresh=false", func(t *testing.T) {
 				res, _ := initAuthenticatedFlow(t, url.Values{"refresh": {"false"}}, false)
-				assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+				assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 			})
 
 			t.Run("case=does set forced flag on authenticated request with refresh=true", func(t *testing.T) {
@@ -728,7 +777,7 @@ func TestFlowLifecycle(t *testing.T) {
 
 				res, err := c.Do(req)
 				require.NoError(t, err)
-				defer res.Body.Close()
+				defer func() { _ = res.Body.Close() }()
 				// here we check that the redirect status is 303
 				require.Equal(t, http.StatusSeeOther, res.StatusCode)
 			})
@@ -789,6 +838,31 @@ func TestFlowLifecycle(t *testing.T) {
 
 				assert.NotEmpty(t, gjson.GetBytes(body, "oauth2_login_request").Value(), "%s", body)
 			})
+
+			t.Run("case=oauth2 flow with existing session and JSON request should not return null", func(t *testing.T) {
+				// This test reproduces issue #10255 where the /self-service/login/browser endpoint
+				// returns null when called with an existing session, a Hydra login challenge, and
+				// an Accept: application/json header.
+
+				// Has a side effect on this test suite but since its running serial and there is no significantly easier way it's acceptable.
+				fakeHydra.Skip = true
+				t.Cleanup(func() {
+					fakeHydra.Skip = false
+				})
+
+				// Make a login request with an authenticated session, Hydra login challenge, and JSON accept
+				req := testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+login.RouteInitBrowserFlow+"?login_challenge="+hydra.FakeValidLoginChallenge, nil)
+				req.Header.Set("Accept", "application/json")
+				body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, routerPublic, req)
+
+				// Before the fix, this would return 200 OK with "null" as body because of variable shadowing
+				// After the fix, it should return a proper error response with ErrAlreadyLoggedIn
+				assert.Equal(t, http.StatusBadRequest, res.StatusCode, "Response should be 400 Bad Request, got body: %s", body)
+				assert.NotEqual(t, "null", string(body), "Response should not be null")
+				assert.NotEmpty(t, gjson.GetBytes(body, "error.id").String(), "Should have error.id field, got body: %s", body)
+				assert.Equal(t, "session_already_available", gjson.GetBytes(body, "error.id").String(), "Should return session_already_available error, got body: %s", body)
+				assert.Contains(t, gjson.GetBytes(body, "error.reason").String(), "A valid session was detected", "Should have proper error reason, got body: %s", body)
+			})
 		})
 
 		t.Run("case=relative redirect when self-service login ui is a relative URL", func(t *testing.T) {
@@ -804,12 +878,18 @@ func TestFlowLifecycle(t *testing.T) {
 
 func TestGetFlow(t *testing.T) {
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	public, _ := testhelpers.NewKratosServerWithCSRF(t, reg)
 	_ = testhelpers.NewErrorTestServer(t, reg)
-	_ = testhelpers.NewRedirTS(t, "", conf)
+	returnToTS := testhelpers.NewRedirTS(t, "", conf)
 
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/password.schema.json")
+	conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+		{ID: "default", URL: "file://./stub/password.schema.json"},
+		{ID: "email", URL: "file://./stub/email.schema.json", SelfserviceSelectable: true},
+		{ID: "phone", URL: "file://./stub/phone.schema.json", SelfserviceSelectable: true},
+		{ID: "not-allowed", URL: "file://./stub/password.schema.json"},
+	})
 
 	setupLoginUI := func(t *testing.T, c *http.Client) *httptest.Server {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -818,7 +898,7 @@ func TestGetFlow(t *testing.T) {
 			require.NoError(t, err)
 		}))
 		conf.MustSet(ctx, config.ViperKeySelfServiceLoginUI, ts.URL)
-		conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
+		conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToTS.URL)
 		t.Cleanup(ts.Close)
 		return ts
 	}
@@ -865,13 +945,13 @@ func TestGetFlow(t *testing.T) {
 		assert.Equal(t, public.URL+login.RouteInitBrowserFlow, gjson.GetBytes(body, "error.details.redirect_to").String(), "%s", body)
 	})
 
-	t.Run("case=expired with return_to", func(t *testing.T) {
-		returnTo := "https://www.ory.sh"
+	t.Run("case=expired with return_to and schema_id", func(t *testing.T) {
+		returnTo := returnToTS.URL
 		conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
 
 		client := testhelpers.NewClientWithCookies(t)
 		setupLoginUI(t, client)
-		body := testhelpers.EasyGetBody(t, client, public.URL+login.RouteInitBrowserFlow+"?return_to="+returnTo)
+		body := testhelpers.EasyGetBody(t, client, public.URL+login.RouteInitBrowserFlow+"?return_to="+returnTo+"&identity_schema=email")
 
 		// Expire the flow
 		f, err := reg.LoginFlowPersister().GetLoginFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(body, "id").String()))
@@ -894,7 +974,7 @@ func TestGetFlow(t *testing.T) {
 
 		f, err = reg.LoginFlowPersister().GetLoginFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(resBody, "id").String()))
 		require.NoError(t, err)
-		assert.Equal(t, public.URL+login.RouteInitBrowserFlow+"?return_to="+returnTo, f.RequestURL)
+		assert.Equal(t, public.URL+login.RouteInitBrowserFlow+"?return_to="+returnTo+"&identity_schema=email", f.RequestURL)
 	})
 
 	t.Run("case=not found", func(t *testing.T) {

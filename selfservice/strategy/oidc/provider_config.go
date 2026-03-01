@@ -39,6 +39,7 @@ type Configuration struct {
 	// - dingtalk
 	// - linkedin
 	// - patreon
+	// - amazon
 	Provider string `json:"provider"`
 
 	// Label represents an optional label which can be used in the UI generation.
@@ -146,12 +147,12 @@ func (p Configuration) Redir(public *url.URL) string {
 
 	if p.OrganizationID != "" {
 		route := RouteOrganizationCallback
-		route = strings.Replace(route, ":provider", p.ID, 1)
-		route = strings.Replace(route, ":organization", p.OrganizationID, 1)
+		route = strings.Replace(route, "{provider}", p.ID, 1)
+		route = strings.Replace(route, "{organization}", p.OrganizationID, 1)
 		return urlx.AppendPaths(public, route).String()
 	}
 
-	return urlx.AppendPaths(public, strings.Replace(RouteCallback, ":provider", p.ID, 1)).String()
+	return urlx.AppendPaths(public, strings.Replace(RouteCallback, "{provider}", p.ID, 1)).String()
 }
 
 type ConfigurationCollection struct {
@@ -189,6 +190,7 @@ var supportedProviders = map[string]func(config *Configuration, reg Dependencies
 	"line":        NewProviderLineV21,
 	"jackson":     NewProviderJackson,
 	"fedcm-test":  NewProviderTestFedcm,
+	"amazon":      NewProviderAmazon,
 }
 
 func (c ConfigurationCollection) Provider(id string, reg Dependencies) (Provider, error) {

@@ -184,7 +184,7 @@ func TestMarshalIdentityWithCredentialsWhenCredentialsNil(t *testing.T) {
 	i.Credentials = nil
 
 	var b bytes.Buffer
-	require.Nil(t, json.NewEncoder(&b).Encode(WithCredentialsMetadataAndAdminMetadataInJSON(*i)))
+	require.Nil(t, json.NewEncoder(&b).Encode(WithCredentialsNoConfigAndAdminMetadataInJSON(*i)))
 
 	assert.False(t, gjson.Get(b.String(), "credentials").Exists())
 }
@@ -200,7 +200,7 @@ func TestMarshalIdentityWithAdminMetadata(t *testing.T) {
 	assert.Equal(t, "metadata", gjson.GetBytes(i.MetadataAdmin, "some").String(), "Original metadata_admin should not be touched by marshalling")
 }
 
-func TestMarshalIdentityWithCredentialsMetadata(t *testing.T) {
+func TestMarshalIdentityWithCredentialsNoConfig(t *testing.T) {
 	t.Parallel()
 
 	i := NewIdentity(config.DefaultIdentityTraitsSchemaID)
@@ -213,13 +213,13 @@ func TestMarshalIdentityWithCredentialsMetadata(t *testing.T) {
 	i.Credentials = credentials
 	i.MetadataAdmin = []byte(`{"some":"metadata"}`)
 
-	rawJSON, err := json.Marshal((*WithCredentialsMetadataAndAdminMetadataInJSON)(i))
+	rawJSON, err := json.Marshal((*WithCredentialsNoConfigAndAdminMetadataInJSON)(i))
 	require.NoError(t, err)
 
-	credentialsInJson := gjson.GetBytes(rawJSON, "credentials")
-	assert.Truef(t, credentialsInJson.Exists(), "Credentials should be rendered to JSON, but got: %q", credentialsInJson.Raw)
+	credentialsInJSON := gjson.GetBytes(rawJSON, "credentials")
+	assert.Truef(t, credentialsInJSON.Exists(), "Credentials should be rendered to JSON, but got: %q", credentialsInJSON.Raw)
 
-	assert.JSONEq(t, `{"password":{"type":"password","identifiers":null,"updated_at":"0001-01-01T00:00:00Z","created_at":"0001-01-01T00:00:00Z","version":0}}`, credentialsInJson.Raw)
+	assert.JSONEq(t, `{"password":{"type":"password","identifiers":null,"updated_at":"0001-01-01T00:00:00Z","created_at":"0001-01-01T00:00:00Z","version":0}}`, credentialsInJSON.Raw)
 	assert.Equal(t, credentials, i.Credentials, "Original credentials should not be touched by marshalling")
 	assert.Equal(t, "metadata", gjson.GetBytes(i.MetadataAdmin, "some").String(), "Original metadata_admin should not be touched by marshalling")
 }
@@ -240,10 +240,10 @@ func TestMarshalIdentityWithAll(t *testing.T) {
 	var b bytes.Buffer
 	require.Nil(t, json.NewEncoder(&b).Encode(WithCredentialsAndAdminMetadataInJSON(*i)))
 
-	credentialsInJson := gjson.Get(b.String(), "credentials")
-	assert.True(t, credentialsInJson.Exists())
+	credentialsInJSON := gjson.Get(b.String(), "credentials")
+	assert.True(t, credentialsInJSON.Exists())
 
-	snapshotx.SnapshotT(t, json.RawMessage(credentialsInJson.Raw))
+	snapshotx.SnapshotT(t, json.RawMessage(credentialsInJSON.Raw))
 	assert.Equal(t, credentials, i.Credentials, "Original credentials should not be touched by marshalling")
 	assert.Equal(t, "metadata", gjson.GetBytes(i.MetadataAdmin, "some").String(), "Original credentials should not be touched by marshalling")
 }
@@ -358,23 +358,32 @@ func TestWithDeclassifiedCredentials(t *testing.T) {
 		CredentialsTypePassword: {
 			Identifiers: []string{"zab", "bar"},
 			Type:        CredentialsTypePassword,
-			Config:      sqlxx.JSONRawMessage("{\"some\" : \"secret\"}"),
+			Config:      sqlxx.JSONRawMessage(`{"some": "secret"}`),
 		},
 		CredentialsTypeOIDC: {
 			Type:        CredentialsTypeOIDC,
 			Identifiers: []string{"bar", "baz"},
-			Config:      sqlxx.JSONRawMessage(`{"providers": [{"initial_id_token": "666f6f"}]}`),
+			// hint:
+			//	echo '666f6f' | xxd -r -p
+			Config: sqlxx.JSONRawMessage(`{"providers": [{"subject":"bar","provider":"oidc1","initial_id_token":"666f6f"}]}`),
+		},
+		CredentialsTypeSAML: {
+			Type:        CredentialsTypeSAML,
+			Identifiers: []string{"qux", "quz"},
+			// hint:
+			//	echo 'this should not appear in output' | xxd -ps -c 0
+			Config: sqlxx.JSONRawMessage(`{"providers": [{"subject":"qux","provider":"saml1","initial_id_token":"746869732073686f756c64206e6f742061707065617220696e206f75747075740a"}]}`),
 		},
 		CredentialsTypeWebAuthn: {
 			Type:        CredentialsTypeWebAuthn,
 			Identifiers: []string{"foo", "bar"},
-			Config:      sqlxx.JSONRawMessage("{\"some\" : \"secret\"}"),
+			Config:      sqlxx.JSONRawMessage(`{"some": "secret"}`),
 		},
 	}
 	i.Credentials = credentials
 
 	t.Run("case=no-include", func(t *testing.T) {
-		actualIdentity, err := i.WithDeclassifiedCredentials(ctx, &cipherProvider{}, nil)
+		actualIdentity, err := i.WithDeclassifiedCredentials(t.Context(), &cipherProvider{}, nil)
 		require.NoError(t, err)
 
 		for ct, actual := range actualIdentity.Credentials {
@@ -385,7 +394,7 @@ func TestWithDeclassifiedCredentials(t *testing.T) {
 	})
 
 	t.Run("case=include-webauthn", func(t *testing.T) {
-		actualIdentity, err := i.WithDeclassifiedCredentials(ctx, &cipherProvider{}, []CredentialsType{CredentialsTypeWebAuthn})
+		actualIdentity, err := i.WithDeclassifiedCredentials(t.Context(), &cipherProvider{}, []CredentialsType{CredentialsTypeWebAuthn})
 		require.NoError(t, err)
 
 		for ct, actual := range actualIdentity.Credentials {
@@ -396,7 +405,7 @@ func TestWithDeclassifiedCredentials(t *testing.T) {
 	})
 
 	t.Run("case=include-multi", func(t *testing.T) {
-		actualIdentity, err := i.WithDeclassifiedCredentials(ctx, &cipherProvider{}, []CredentialsType{CredentialsTypeWebAuthn, CredentialsTypePassword})
+		actualIdentity, err := i.WithDeclassifiedCredentials(t.Context(), &cipherProvider{}, []CredentialsType{CredentialsTypeWebAuthn, CredentialsTypePassword})
 		require.NoError(t, err)
 
 		for ct, actual := range actualIdentity.Credentials {
@@ -407,7 +416,17 @@ func TestWithDeclassifiedCredentials(t *testing.T) {
 	})
 
 	t.Run("case=oidc", func(t *testing.T) {
-		actualIdentity, err := i.WithDeclassifiedCredentials(ctx, &cipherProvider{}, []CredentialsType{CredentialsTypeOIDC})
+		actualIdentity, err := i.WithDeclassifiedCredentials(t.Context(), &cipherProvider{}, []CredentialsType{CredentialsTypeOIDC})
+		require.NoError(t, err)
+
+		for ct, actual := range actualIdentity.Credentials {
+			t.Run("credential="+string(ct), func(t *testing.T) {
+				snapshotx.SnapshotT(t, actual)
+			})
+		}
+	})
+	t.Run("case=saml", func(t *testing.T) {
+		actualIdentity, err := i.WithDeclassifiedCredentials(t.Context(), &cipherProvider{}, []CredentialsType{CredentialsTypeSAML})
 		require.NoError(t, err)
 
 		for ct, actual := range actualIdentity.Credentials {
@@ -418,51 +437,63 @@ func TestWithDeclassifiedCredentials(t *testing.T) {
 	})
 }
 
-func TestDeleteCredentialOIDCFromIdentity(t *testing.T) {
+func TestDeleteCredentialOIDCSAMLFromIdentity(t *testing.T) {
 	t.Parallel()
 
 	i := NewIdentity(config.DefaultIdentityTraitsSchemaID)
 
-	err := i.deleteCredentialOIDCFromIdentity("")
+	err := i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "")
 	assert.Error(t, err)
-	err = i.deleteCredentialOIDCFromIdentity("does-not-exist")
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "does-not-exist")
+	assert.Error(t, err)
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeSAML, "")
+	assert.Error(t, err)
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeSAML, "does-not-exist")
 	assert.Error(t, err)
 
 	credentials := map[CredentialsType]Credentials{
 		CredentialsTypePassword: {
 			Identifiers: []string{"zab", "bar"},
 			Type:        CredentialsTypePassword,
-			Config:      sqlxx.JSONRawMessage("{\"some\" : \"secret\"}"),
+			Config:      sqlxx.JSONRawMessage(`{"some" : "secret"}`),
 		},
 		CredentialsTypeOIDC: {
 			Type:        CredentialsTypeOIDC,
 			Identifiers: []string{"bar:1234", "baz:5678"},
 			Config:      sqlxx.JSONRawMessage(`{"providers": [{"provider": "bar", "subject": "1234"}, {"provider": "baz", "subject": "5678"}]}`),
 		},
+		CredentialsTypeSAML: {
+			Type:        CredentialsTypeSAML,
+			Identifiers: []string{"bar:1234", "baz:5678"},
+			Config:      sqlxx.JSONRawMessage(`{"providers": [{"provider": "bar", "subject": "1234"}, {"provider": "baz", "subject": "5678"}]}`),
+		},
 		CredentialsTypeWebAuthn: {
 			Type:        CredentialsTypeWebAuthn,
 			Identifiers: []string{"foo", "bar"},
-			Config:      sqlxx.JSONRawMessage("{\"some\" : \"secret\"}"),
+			Config:      sqlxx.JSONRawMessage(`{"some" : "secret"}`),
 		},
 	}
 	i.Credentials = credentials
 
-	err = i.deleteCredentialOIDCFromIdentity("zab")
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "zab")
 	assert.Error(t, err)
-	err = i.deleteCredentialOIDCFromIdentity("foo")
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "foo")
 	assert.Error(t, err)
-	err = i.deleteCredentialOIDCFromIdentity("bar")
+	err = i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "bar")
 	assert.Error(t, err, "matches multiple OIDC credentials")
 
-	require.NoError(t, i.deleteCredentialOIDCFromIdentity("bar:1234"))
+	require.NoError(t, i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeOIDC, "bar:1234"))
 
-	assert.Len(t, i.Credentials, 3)
+	assert.Len(t, i.Credentials, 4)
 
 	assert.Contains(t, i.Credentials, CredentialsTypePassword)
 	assert.EqualValues(t, i.Credentials[CredentialsTypePassword].Identifiers, []string{"zab", "bar"})
 
 	assert.Contains(t, i.Credentials, CredentialsTypeWebAuthn)
 	assert.EqualValues(t, i.Credentials[CredentialsTypeWebAuthn].Identifiers, []string{"foo", "bar"})
+
+	assert.Contains(t, i.Credentials, CredentialsTypeSAML)
+	assert.EqualValues(t, i.Credentials[CredentialsTypeSAML].Identifiers, []string{"bar:1234", "baz:5678"})
 
 	assert.Contains(t, i.Credentials, CredentialsTypeOIDC)
 
@@ -473,6 +504,21 @@ func TestDeleteCredentialOIDCFromIdentity(t *testing.T) {
 	_, err = i.ParseCredentials(CredentialsTypeOIDC, &cfg)
 	require.NoError(t, err)
 	assert.EqualValues(t, CredentialsOIDC{Providers: []CredentialsOIDCProvider{{Provider: "baz", Subject: "5678"}}}, cfg)
+
+	require.NoError(t, i.deleteCredentialOIDCSAMLFromIdentity(CredentialsTypeSAML, "baz:5678"))
+
+	assert.Len(t, i.Credentials, 4)
+	assert.Contains(t, i.Credentials, CredentialsTypeOIDC)
+	assert.EqualValues(t, i.Credentials[CredentialsTypeOIDC].Identifiers, []string{"baz:5678"})
+
+	assert.Contains(t, i.Credentials, CredentialsTypeSAML)
+	saml, ok := i.GetCredentials(CredentialsTypeSAML)
+	require.True(t, ok)
+	assert.EqualValues(t, saml.Identifiers, []string{"bar:1234"})
+	var samlCfg CredentialsOIDC
+	_, err = i.ParseCredentials(CredentialsTypeSAML, &samlCfg)
+	require.NoError(t, err)
+	assert.EqualValues(t, CredentialsOIDC{Providers: []CredentialsOIDCProvider{{Provider: "bar", Subject: "1234"}}}, samlCfg)
 }
 
 func TestMergeOIDCCredentials(t *testing.T) {

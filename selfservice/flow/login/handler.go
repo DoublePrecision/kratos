@@ -5,12 +5,10 @@ package login
 
 import (
 	"net/http"
-	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -32,7 +30,9 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
-	"github.com/ory/x/decoderx"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
@@ -50,7 +50,7 @@ const (
 )
 
 type (
-	handlerDependencies interface {
+	dependencies interface {
 		HookExecutorProvider
 		FlowPersistenceProvider
 		errorx.ManagementProvider
@@ -58,29 +58,24 @@ type (
 		StrategyProvider
 		session.HandlerProvider
 		session.ManagementProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		nosurfx.CSRFTokenGeneratorProvider
 		nosurfx.CSRFProvider
-		x.TracingProvider
+		otelx.Provider
 		config.Provider
 		ErrorHandlerProvider
 		sessiontokenexchange.PersistenceProvider
-		x.LoggingProvider
+		logrusx.Provider
 	}
 	HandlerProvider interface {
 		LoginHandler() *Handler
 	}
-	Handler struct {
-		d  handlerDependencies
-		hd *decoderx.HTTP
-	}
+	Handler struct{ d dependencies }
 )
 
-func NewHandler(d handlerDependencies) *Handler {
-	return &Handler{d: d, hd: decoderx.NewHTTP()}
-}
+func NewHandler(d dependencies) *Handler { return &Handler{d: d} }
 
-func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
+func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
@@ -92,7 +87,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	public.GET(RouteSubmitFlow, h.updateLoginFlow)
 }
 
-func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
+func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
@@ -135,6 +130,12 @@ func WithIsAccountLinking() FlowOption {
 	}
 }
 
+func WithLoginChallenge(loginChallenge string) FlowOption {
+	return func(f *Flow) {
+		f.OAuth2LoginChallenge = sqlxx.NullString(loginChallenge)
+	}
+}
+
 func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, *session.Session, error) {
 	conf := h.d.Config()
 	f, err := NewFlow(conf, conf.SelfServiceFlowLoginRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, ft)
@@ -152,6 +153,14 @@ func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.T
 	switch cs := stringsx.SwitchExact(string(f.RequestedAAL)); {
 	case cs.AddCase(string(identity.AuthenticatorAssuranceLevel1)):
 		f.RequestedAAL = identity.AuthenticatorAssuranceLevel1
+		identitySchema := ""
+		if requestedSchema := r.URL.Query().Get("identity_schema"); requestedSchema != "" {
+			identitySchema, err = conf.SelfServiceFlowIdentitySchema(r.Context(), requestedSchema)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		f.IdentitySchema = flow.IdentitySchema(identitySchema)
 	case cs.AddCase(string(identity.AuthenticatorAssuranceLevel2)):
 		f.RequestedAAL = identity.AuthenticatorAssuranceLevel2
 	default:
@@ -167,7 +176,7 @@ func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.T
 		if ft == flow.TypeAPI && returnSessionTokenExchangeCode {
 			e, err := h.d.SessionTokenExchangePersister().CreateSessionTokenExchanger(r.Context(), f.ID)
 			if err != nil {
-				return nil, nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err))
+				return nil, nil, errors.WithStack(err)
 			}
 			f.SessionTokenExchangeCode = e.InitCode
 		}
@@ -209,36 +218,48 @@ func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.T
 	}
 
 preLoginHook:
-	for _, s := range h.d.LoginStrategies(r.Context(), PrepareOrganizations(r, f, sess)...) {
+	loginStrategies := h.d.LoginStrategies(r.Context(), PrepareOrganizations(r, f, sess)...)
+	for _, s := range loginStrategies {
 		var populateErr error
 
-		switch strategy := s.(type) {
-		case FormHydrator:
-			switch {
-			case f.RequestedAAL == identity.AuthenticatorAssuranceLevel1:
+		switch f.RequestedAAL {
+		case identity.AuthenticatorAssuranceLevel1:
+			switch s := s.(type) {
+			case AAL1FormHydrator:
 				switch {
 				case f.IsRefresh() && sess != nil:
 					// Refreshing takes precedence over identifier_first auth which can not be a refresh flow.
 					// Therefor this comes first.
-					populateErr = strategy.PopulateLoginMethodFirstFactorRefresh(r, f, sess)
+					populateErr = s.PopulateLoginMethodFirstFactorRefresh(r, f, sess)
 				case h.d.Config().SelfServiceLoginFlowIdentifierFirstEnabled(r.Context()) && !f.isAccountLinkingFlow:
-					populateErr = strategy.PopulateLoginMethodIdentifierFirstIdentification(r, f)
+					populateErr = s.PopulateLoginMethodIdentifierFirstIdentification(r, f)
 				default:
-					populateErr = strategy.PopulateLoginMethodFirstFactor(r, f)
+					populateErr = s.PopulateLoginMethodFirstFactor(r, f)
 				}
-			case f.RequestedAAL == identity.AuthenticatorAssuranceLevel2:
+			case AAL2FormHydrator:
+				continue
+			default:
+				populateErr = errors.WithStack(
+					x.PseudoPanic.WithReasonf("A login strategy was expected to implement interface AAL1FormHydrator but did not."),
+				)
+			}
+		case identity.AuthenticatorAssuranceLevel2:
+			switch s := s.(type) {
+			case AAL2FormHydrator:
 				switch {
 				case f.IsRefresh():
 					// Refresh takes precedence.
-					populateErr = strategy.PopulateLoginMethodSecondFactorRefresh(r, f)
+					populateErr = s.PopulateLoginMethodSecondFactorRefresh(r, f)
 				default:
-					populateErr = strategy.PopulateLoginMethodSecondFactor(r, f)
+					populateErr = s.PopulateLoginMethodSecondFactor(r, f)
 				}
+			case AAL1FormHydrator:
+				continue
+			default:
+				populateErr = errors.WithStack(
+					x.PseudoPanic.WithReasonf("A login strategy was expected to implement interface AAL2FormHydrator but did not."),
+				)
 			}
-		case UnifiedFormHydrator:
-			populateErr = strategy.PopulateLoginMethod(r, f.RequestedAAL, f)
-		default:
-			populateErr = errors.WithStack(x.PseudoPanic.WithReasonf("A login strategy was expected to implement one of the interfaces UnifiedFormHydrator or FormHydrator but did not."))
 		}
 
 		if populateErr != nil {
@@ -263,12 +284,29 @@ preLoginHook:
 	}
 
 	if err := h.d.LoginHookExecutor().PreLoginHook(w, r, f); err != nil {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return f, sess, nil
 	}
 
 	if err := h.d.LoginFlowPersister().CreateLoginFlow(r.Context(), f); err != nil {
 		return nil, nil, err
+	}
+
+	// If the strategy supports fast login, we can attempt a fast path.
+	// We execute the fast login here because it requires the flow to be created first.
+	for _, s := range loginStrategies {
+		if strategy, ok := s.(FastLoginStrategy); ok {
+			if err := strategy.FastLogin2FA(w, r, f, sess); errors.Is(err, flow.ErrStrategyNotResponsible) {
+				continue
+			} else if errors.Is(err, flow.ErrCompletedByStrategy) {
+				span := trace.SpanFromContext(r.Context())
+				span.AddEvent(events.NewLoginInitiated(r.Context(), f.ID, ft.String(), f.Refresh, f.OrganizationID, string(f.RequestedAAL)))
+				return nil, nil, err
+			} else if err != nil {
+				return nil, nil, err
+			}
+			break
+		}
 	}
 
 	span := trace.SpanFromContext(r.Context())
@@ -283,6 +321,7 @@ func (h *Handler) FromOldFlow(w http.ResponseWriter, r *http.Request, of Flow) (
 	}
 
 	nf.RequestURL = of.RequestURL
+	nf.IdentitySchema = of.IdentitySchema
 	return nf, nil
 }
 
@@ -342,6 +381,12 @@ type createNativeLoginFlow struct {
 	//
 	// in: query
 	Via string `json:"via"`
+
+	// An optional identity schema to use for the login flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // swagger:route GET /self-service/login/api frontend createNativeLoginFlow
@@ -378,7 +423,10 @@ type createNativeLoginFlow struct {
 //	  200: loginFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeLoginFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createNativeLoginFlow(w http.ResponseWriter, r *http.Request) {
 	var err error
 	ctx, span := h.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.login.createNativeLoginFlow")
 	r = r.WithContext(ctx)
@@ -386,7 +434,9 @@ func (h *Handler) createNativeLoginFlow(w http.ResponseWriter, r *http.Request, 
 
 	f, _, err := h.NewLoginFlow(w, r, flow.TypeAPI)
 	if err != nil {
-		h.d.Writer().WriteError(w, r, err)
+		if !errors.Is(err, flow.ErrCompletedByStrategy) {
+			h.d.Writer().WriteError(w, r, err)
+		}
 		return
 	}
 
@@ -457,6 +507,12 @@ type createBrowserLoginFlow struct {
 	//
 	// in: query
 	Via string `json:"via"`
+
+	// An optional identity schema to use for the login flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // swagger:route GET /self-service/login/browser frontend createBrowserLoginFlow
@@ -497,7 +553,10 @@ type createBrowserLoginFlow struct {
 //	  303: emptyResponse
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createBrowserLoginFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-medium
+func (h *Handler) createBrowserLoginFlow(w http.ResponseWriter, r *http.Request) {
 	var err error
 	ctx, span := h.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.login.createBrowserLoginFlow")
 	r = r.WithContext(ctx)
@@ -545,27 +604,22 @@ func (h *Handler) createBrowserLoginFlow(w http.ResponseWriter, r *http.Request,
 	if errors.Is(err, ErrAlreadyLoggedIn) {
 		if hydraLoginRequest != nil {
 			if !hydraLoginRequest.GetSkip() {
-				h.d.SelfServiceErrorManager().Forward(ctx, w, r, errors.WithStack(herodot.ErrInternalServerError.WithReason("ErrAlreadyLoggedIn indicated we can skip login, but Hydra asked us to refresh")))
+				h.d.SelfServiceErrorManager().Forward(ctx, w, r, errors.WithStack(herodot.ErrForbidden.WithReason("ErrAlreadyLoggedIn indicated we can skip login, but Hydra asked us to refresh")))
 				return
 			}
 
-			rt, err := h.d.Hydra().AcceptLoginRequest(ctx,
+			rt, hydraErr := h.d.Hydra().AcceptLoginRequest(ctx,
 				hydra.AcceptLoginRequestParams{
 					LoginChallenge:        string(hydraLoginChallenge),
 					IdentityID:            sess.IdentityID.String(),
 					SessionID:             sess.ID.String(),
 					AuthenticationMethods: sess.AMR,
 				})
-			if err != nil {
-				h.d.SelfServiceErrorManager().Forward(ctx, w, r, err)
+			if hydraErr != nil {
+				h.d.SelfServiceErrorManager().Forward(ctx, w, r, hydraErr)
 				return
 			}
-			returnTo, err := url.Parse(rt)
-			if err != nil {
-				h.d.SelfServiceErrorManager().Forward(ctx, w, r, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to parse URL: %s", rt)))
-				return
-			}
-			x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), err, returnTo.String())
+			x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), err, rt)
 			return
 		}
 
@@ -579,6 +633,8 @@ func (h *Handler) createBrowserLoginFlow(w http.ResponseWriter, r *http.Request,
 		}
 
 		x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), err, returnTo.String())
+		return
+	} else if errors.Is(err, flow.ErrCompletedByStrategy) {
 		return
 	} else if err != nil {
 		h.d.SelfServiceErrorManager().Forward(ctx, w, r, err)
@@ -655,7 +711,10 @@ type getLoginFlow struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getLoginFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-low
+func (h *Handler) getLoginFlow(w http.ResponseWriter, r *http.Request) {
 	var err error
 	ctx, span := h.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.login.getLoginFlow")
 	r = r.WithContext(ctx)
@@ -797,22 +856,28 @@ type updateLoginFlowBody struct{}
 //	  410: errorGeneric
 //	  422: errorBrowserLocationChangeRequired
 //	  default: errorGeneric
-func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-high
+func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request) {
 	var err error
 	ctx, span := h.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.login.updateLoginFlow")
-	ctx = semconv.ContextWithAttributes(ctx, attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "login"))
+	ctx = semconv.ContextWithAttributes(ctx,
+		attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "login"),
+		attribute.String(events.AttributeKeySelfServiceFlowName.String(), "login"),
+	)
 	r = r.WithContext(ctx)
 	defer otelx.End(span, &err)
 
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, nil, "", node.DefaultGroup, err)
 		return
 	}
 
 	f, err := h.d.LoginFlowPersister().GetLoginFlow(ctx, rid)
 	if err != nil {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}
 
@@ -830,7 +895,7 @@ func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request, _ http
 
 		if x.IsJSONRequest(r) || f.Type == flow.TypeAPI {
 			// We are not upgrading AAL, nor are we refreshing. Error!
-			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, errors.WithStack(ErrAlreadyLoggedIn))
+			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, errors.WithStack(ErrAlreadyLoggedIn))
 			return
 		}
 
@@ -840,22 +905,23 @@ func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request, _ http
 		// Only failure scenario here is if we try to upgrade the session to a higher AAL without actually
 		// having a session.
 		if f.RequestedAAL > identity.AuthenticatorAssuranceLevel1 {
-			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, errors.WithStack(ErrSessionRequiredForHigherAAL))
+			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, errors.WithStack(ErrSessionRequiredForHigherAAL))
 			return
 		}
 
 		sess = session.NewInactiveSession()
 	} else {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}
 
 continueLogin:
 	if err := f.Valid(); err != nil {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}
 
+	var ct identity.CredentialsType
 	var i *identity.Identity
 	var group node.UiNodeGroup
 	for _, ss := range h.d.AllLoginStrategies() {
@@ -866,7 +932,7 @@ continueLogin:
 		} else if errors.Is(err, flow.ErrCompletedByStrategy) {
 			return
 		} else if err != nil {
-			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, group, err)
+			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, ss.ID(), group, err)
 			return
 		}
 
@@ -879,21 +945,22 @@ continueLogin:
 		method := ss.CompletedAuthenticationMethod(ctx)
 		sess.CompletedLoginForMethod(method)
 		i = interim
+		ct = ss.ID()
 		break
 	}
 
 	if i == nil {
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, errors.WithStack(schema.NewNoLoginStrategyResponsible()))
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, ct, node.DefaultGroup, errors.WithStack(schema.NewNoLoginStrategyResponsible()))
 		return
 	}
 
 	if err := h.d.LoginHookExecutor().PostLoginHook(w, r, group, f, i, sess, ""); err != nil {
 		if errors.Is(err, ErrAddressNotVerified) {
-			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, errors.WithStack(schema.NewAddressNotVerifiedError()))
+			h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, ct, node.DefaultGroup, errors.WithStack(schema.NewAddressNotVerifiedError()))
 			return
 		}
 
-		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, node.DefaultGroup, err)
+		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, ct, node.DefaultGroup, err)
 		return
 	}
 }

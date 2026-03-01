@@ -197,6 +197,28 @@ func NewErrorValidationConstGeneric() *Message {
 	}
 }
 
+func NewErrorValidationEmail(value string) *Message {
+	return &Message{
+		ID:   ErrorValidationEmail,
+		Text: "Enter a valid email address",
+		Type: Error,
+		Context: context(map[string]any{
+			"value": value,
+		}),
+	}
+}
+
+func NewErrorValidationPhone(value string) *Message {
+	return &Message{
+		ID:   ErrorValidationPhone,
+		Text: "Enter a valid phone number",
+		Type: Error,
+		Context: context(map[string]any{
+			"value": value,
+		}),
+	}
+}
+
 func NewErrorValidationPasswordPolicyViolationGeneric(reason string) *Message {
 	return &Message{
 		ID:   ErrorValidationPasswordPolicyViolationGeneric,
@@ -237,6 +259,14 @@ func NewErrorValidationPasswordMaxLength(maxLength, actualLength int) *Message {
 			"max_length":    maxLength,
 			"actual_length": actualLength,
 		}),
+	}
+}
+
+func NewErrorValidationPasswordNewSameAsOld() *Message {
+	return &Message{
+		ID:   ErrorValidationPasswordNewSameAsOld,
+		Text: "The new password must be different from the old password.",
+		Type: Error,
 	}
 }
 

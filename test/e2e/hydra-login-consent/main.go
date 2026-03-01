@@ -7,12 +7,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/julienschmidt/httprouter"
-
 	client "github.com/ory/hydra-client-go/v2"
 
 	"github.com/ory/x/osx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/urlx"
 )
 
@@ -31,7 +28,7 @@ func checkReq(w http.ResponseWriter, err error) bool {
 }
 
 func main() {
-	router := httprouter.New()
+	router := http.NewServeMux()
 
 	adminURL := urlx.ParseOrPanic(osx.GetenvDefault("HYDRA_ADMIN_URL", "http://localhost:4445"))
 	cfg := client.NewConfiguration()
@@ -40,10 +37,10 @@ func main() {
 	}
 	hc := client.NewAPIClient(cfg)
 
-	router.GET("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`ok`))
 	})
-	router.GET("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) {
 		res, _, err := hc.OAuth2Api.GetOAuth2LoginRequest(r.Context()).LoginChallenge(r.URL.Query().Get("login_challenge")).Execute()
 		if !checkReq(w, err) {
 			return
@@ -53,8 +50,8 @@ func main() {
 			res, _, err := hc.OAuth2Api.AcceptOAuth2LoginRequest(r.Context()).
 				LoginChallenge(r.URL.Query().Get("login_challenge")).
 				AcceptOAuth2LoginRequest(client.AcceptOAuth2LoginRequest{
-					Remember:    pointerx.Bool(true),
-					RememberFor: pointerx.Int64(3600),
+					Remember:    new(true),
+					RememberFor: new(int64(3600)),
 					Subject:     res.Subject,
 				}).Execute()
 			if !checkReq(w, err) {
@@ -77,14 +74,14 @@ func main() {
 </html>`, challenge)
 	})
 
-	router.POST("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("POST /login", func(w http.ResponseWriter, r *http.Request) {
 		check(r.ParseForm())
-		remember := pointerx.Bool(r.Form.Get("remember") == "true")
+		remember := new(r.Form.Get("remember") == "true")
 		if r.Form.Get("action") == "accept" {
 			res, _, err := hc.OAuth2Api.AcceptOAuth2LoginRequest(r.Context()).
 				LoginChallenge(r.URL.Query().Get("login_challenge")).
 				AcceptOAuth2LoginRequest(client.AcceptOAuth2LoginRequest{
-					RememberFor: pointerx.Int64(3600),
+					RememberFor: new(int64(3600)),
 					Remember:    remember,
 					Subject:     r.Form.Get("username"),
 				}).Execute()
@@ -96,14 +93,14 @@ func main() {
 			return
 		}
 		res, _, err := hc.OAuth2Api.RejectOAuth2LoginRequest(r.Context()).LoginChallenge(r.URL.Query().Get("login_challenge")).
-			RejectOAuth2Request(client.RejectOAuth2Request{Error: pointerx.String("login rejected request")}).Execute()
+			RejectOAuth2Request(client.RejectOAuth2Request{Error: new("login rejected request")}).Execute()
 		if !checkReq(w, err) {
 			return
 		}
 		http.Redirect(w, r, res.RedirectTo, http.StatusFound)
 	})
 
-	router.GET("/consent", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /consent", func(w http.ResponseWriter, r *http.Request) {
 		res, _, err := hc.OAuth2Api.GetOAuth2ConsentRequest(r.Context()).ConsentChallenge(r.URL.Query().
 			Get("consent_challenge")).Execute()
 		if !checkReq(w, err) {
@@ -144,9 +141,9 @@ func main() {
 </html>`, challenge, checkoxes)
 	})
 
-	router.POST("/consent", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("POST /consent", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		remember := pointerx.Bool(r.Form.Get("remember") == "true")
+		remember := new(r.Form.Get("remember") == "true")
 		if r.Form.Get("action") == "accept" {
 			res, _, err := hc.OAuth2Api.AcceptOAuth2ConsentRequest(r.Context()).
 				ConsentChallenge(r.URL.Query().Get("consent_challenge")).
@@ -156,9 +153,10 @@ func main() {
 							"website": r.Form.Get("website"),
 						},
 					},
-					RememberFor: pointerx.Int64(3600),
+					RememberFor: new(int64(3600)),
 					Remember:    remember,
-					GrantScope:  r.Form["scope"]},
+					GrantScope:  r.Form["scope"],
+				},
 				).Execute()
 			if !checkReq(w, err) {
 				return
@@ -168,7 +166,7 @@ func main() {
 		}
 		res, _, err := hc.OAuth2Api.RejectOAuth2ConsentRequest(r.Context()).
 			ConsentChallenge(r.URL.Query().Get("consent_challenge")).
-			RejectOAuth2Request(client.RejectOAuth2Request{Error: pointerx.String("consent rejected request")}).Execute()
+			RejectOAuth2Request(client.RejectOAuth2Request{Error: new("consent rejected request")}).Execute()
 		if !checkReq(w, err) {
 			return
 		}

@@ -18,31 +18,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/x/nosurfx"
-
 	"github.com/go-faker/faker/v4"
-	"github.com/peterhellberg/link"
-	"github.com/tidwall/gjson"
-
-	"github.com/ory/kratos/identity"
-
 	"github.com/gofrs/uuid"
+	"github.com/peterhellberg/link"
 	"github.com/pkg/errors"
-
-	"github.com/ory/kratos/corpx"
-	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/sqlcon"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 
+	"github.com/ory/kratos/corpx"
 	"github.com/ory/kratos/driver/config"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	. "github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/ioutilx"
+	"github.com/ory/x/pagination/keysetpagination"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
 
@@ -50,23 +47,25 @@ func init() {
 	corpx.RegisterFakes()
 }
 
-func send(code int) httprouter.Handle {
-	return func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+func send(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(code)
 	}
 }
 
 func TestSessionWhoAmI(t *testing.T) {
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	t.Parallel()
+
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	ts, _, r, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
 	ctx := context.Background()
 
-	// set this intermediate because kratos needs some valid url for CRUDE operations
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "http://example.com")
 	email := "foo" + uuid.Must(uuid.NewV4()).String() + "@bar.sh"
+	externalID := x.NewUUID().String()
 	i := &identity.Identity{
-		ID:    x.NewUUID(),
-		State: identity.StateActive,
+		ID:         x.NewUUID(),
+		ExternalID: sqlxx.NullString(externalID),
+		State:      identity.StateActive,
 		Credentials: map[identity.CredentialsType]identity.Credentials{
 			identity.CredentialsTypePassword: {
 				Type:        identity.CredentialsTypePassword,
@@ -93,16 +92,21 @@ func TestSessionWhoAmI(t *testing.T) {
 	h, _ := testhelpers.MockSessionCreateHandlerWithIdentity(t, reg, i)
 
 	r.GET("/set", h)
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
 
 	t.Run("case=aal requirements", func(t *testing.T) {
-		h1, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg, createAAL2Identity(t, reg), []identity.CredentialsType{identity.CredentialsTypePassword, identity.CredentialsTypeWebAuthn})
+		h1, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg,
+			newAAL2Identity(),
+			[]identity.CredentialsType{identity.CredentialsTypePassword, identity.CredentialsTypeWebAuthn})
 		r.GET("/set/aal2-aal2", h1)
 
-		h2, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg, createAAL2Identity(t, reg), []identity.CredentialsType{identity.CredentialsTypePassword})
+		h2, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg,
+			newAAL2Identity(),
+			[]identity.CredentialsType{identity.CredentialsTypePassword})
 		r.GET("/set/aal2-aal1", h2)
 
-		h3, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg, createAAL1Identity(t, reg), []identity.CredentialsType{identity.CredentialsTypePassword})
+		h3, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg,
+			newAAL1Identity(),
+			[]identity.CredentialsType{identity.CredentialsTypePassword})
 		r.GET("/set/aal1-aal1", h3)
 
 		run := func(t *testing.T, endpoint string, kind string, code int) string {
@@ -159,7 +163,7 @@ func TestSessionWhoAmI(t *testing.T) {
 			// No cookie yet -> 401
 			res, err := client.Get(ts.URL + RouteWhoami)
 			require.NoError(t, err)
-			testhelpers.AssertNoCSRFCookieInResponse(t, ts, client, res) // Test that no CSRF cookie is ever set here.
+			testhelpers.AssertNoCSRFCookieInResponse(t, res) // Test that no CSRF cookie is ever set here.
 
 			if cacheEnabled {
 				assert.NotEmpty(t, res.Header.Get("Ory-Session-Cache-For"))
@@ -187,7 +191,7 @@ func TestSessionWhoAmI(t *testing.T) {
 					require.NoError(t, err)
 					body, err := io.ReadAll(res.Body)
 					require.NoError(t, err)
-					testhelpers.AssertNoCSRFCookieInResponse(t, ts, client, res) // Test that no CSRF cookie is ever set here.
+					testhelpers.AssertNoCSRFCookieInResponse(t, res) // Test that no CSRF cookie is ever set here.
 
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
 					assert.NotEmpty(t, res.Header.Get("X-Kratos-Authenticated-Identity-Id"))
@@ -210,6 +214,8 @@ func TestSessionWhoAmI(t *testing.T) {
 
 					assert.NotEmpty(t, gjson.GetBytes(body, "identity.recovery_addresses").String(), "%s", body)
 					assert.NotEmpty(t, gjson.GetBytes(body, "identity.verifiable_addresses").String(), "%s", body)
+
+					assert.Equal(t, externalID, gjson.GetBytes(body, "identity.external_id").String(), "%s", body)
 				})
 			}
 		}
@@ -228,10 +234,13 @@ func TestSessionWhoAmI(t *testing.T) {
 	})
 
 	t.Run("tokenize", func(t *testing.T) {
-		setTokenizeConfig(conf, "es256", "jwk.es256.json", "")
+		conf.MustSet(t.Context(), config.ViperKeySessionTokenizerTemplates+".es256", &config.SessionTokenizeFormat{
+			TTL:     time.Minute,
+			JWKSURL: "file://stub/jwk.es256.json",
+		})
 		conf.MustSet(ctx, config.ViperKeySessionWhoAmICaching, true)
 
-		h3, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg, createAAL1Identity(t, reg), []identity.CredentialsType{identity.CredentialsTypePassword})
+		h3, _ := testhelpers.MockSessionCreateHandlerWithIdentityAndAMR(t, reg, newAAL1Identity(), []identity.CredentialsType{identity.CredentialsTypePassword})
 		r.GET("/set/tokenize", h3)
 
 		client := testhelpers.NewClientWithCookies(t)
@@ -267,7 +276,7 @@ func TestSessionWhoAmI(t *testing.T) {
 				require.NoError(t, reg.SessionPersister().UpsertSession(context.Background(), s))
 				require.NotEmpty(t, s.Token)
 
-				req, err := http.NewRequest("GET", pts.URL+"/session/get", nil)
+				req, err := http.NewPostRequest("GET", pts.URL+"/session/get", nil)
 				require.NoError(t, err)
 				req.Header.Set("Authorization", "Bearer "+s.Token)
 
@@ -300,7 +309,7 @@ func TestSessionWhoAmI(t *testing.T) {
 					require.NoError(t, reg.SessionPersister().UpsertSession(context.Background(), s))
 					require.NotEmpty(t, s.Token)
 
-					req, err := http.NewRequest("GET", pts.URL+"/session/get", nil)
+					req, err := http.NewPostRequest("GET", pts.URL+"/session/get", nil)
 					require.NoError(t, err)
 					req.Header.Set("Authorization", "Bearer "+s.Token)
 
@@ -340,9 +349,11 @@ func TestSessionWhoAmI(t *testing.T) {
 }
 
 func TestIsNotAuthenticatedSecurecookie(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	r := x.NewRouterPublic()
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
+	r := httprouterx.NewTestRouterPublic(t)
 	r.GET("/public/with-callback", reg.SessionHandler().IsNotAuthenticated(send(http.StatusOK), send(http.StatusBadRequest)))
 
 	ts := httptest.NewServer(r)
@@ -368,11 +379,11 @@ func TestIsNotAuthenticatedSecurecookie(t *testing.T) {
 }
 
 func TestIsNotAuthenticated(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	r := x.NewRouterPublic()
-	// set this intermediate because kratos needs some valid url for CRUDE operations
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "http://example.com")
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
+	r := httprouterx.NewTestRouterPublic(t)
 
 	reg.WithCSRFHandler(new(nosurfx.FakeCSRFHandler))
 	h, _ := testhelpers.MockSessionCreateHandler(t, reg)
@@ -424,10 +435,12 @@ func TestIsNotAuthenticated(t *testing.T) {
 }
 
 func TestIsAuthenticated(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	reg.WithCSRFHandler(new(nosurfx.FakeCSRFHandler))
-	r := x.NewRouterPublic()
+	r := httprouterx.NewTestRouterPublic(t)
 
 	h, _ := testhelpers.MockSessionCreateHandler(t, reg)
 	r.GET("/set", h)
@@ -477,14 +490,10 @@ func TestIsAuthenticated(t *testing.T) {
 }
 
 func TestHandlerAdminSessionManagement(t *testing.T) {
-	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	_, ts, _, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
+	t.Parallel()
 
-	// set this intermediate because kratos needs some valid url for CRUDE operations
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "http://example.com")
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
+	_, reg := pkg.NewFastRegistryWithMocks(t, configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/identity.schema.json")))
+	public, ts := testhelpers.NewKratosServer(t, reg)
 
 	t.Run("case=should return 202 after invalidating all sessions", func(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
@@ -495,7 +504,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			{Method: identity.CredentialsTypePassword, CompletedAt: time.Now().UTC().Round(time.Second)},
 			{Method: identity.CredentialsTypeOIDC, CompletedAt: time.Now().UTC().Round(time.Second)},
 		}
-		require.NoError(t, reg.Persister().CreateIdentity(ctx, s.Identity))
+		require.NoError(t, reg.Persister().CreateIdentity(t.Context(), s.Identity))
 
 		var expectedSessionDevice Device
 		require.NoError(t, faker.FakeData(&expectedSessionDevice))
@@ -503,10 +512,10 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			expectedSessionDevice,
 		}
 
-		assert.Equal(t, uuid.Nil, s.ID)
-		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, s))
-		assert.NotEqual(t, uuid.Nil, s.ID)
-		assert.NotEqual(t, uuid.Nil, s.Identity.ID)
+		assert.Zero(t, s.ID)
+		require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), s))
+		assert.NotZero(t, s.ID)
+		assert.NotZero(t, s.Identity.ID)
 
 		t.Run("get session", func(t *testing.T) {
 			req, _ := http.NewRequest("GET", ts.URL+"/admin/sessions/"+s.ID.String(), nil)
@@ -530,7 +539,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			}{
 				{
 					description:        "expand Identity",
-					expand:             "/?expand=Identity",
+					expand:             "?expand=Identity",
 					expectedIdentityId: s.Identity.ID.String(),
 					expectedDevices:    0,
 				},
@@ -551,12 +560,13 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 					req, _ := http.NewRequest("GET", ts.URL+"/admin/sessions/"+s.ID.String()+tc.expand, nil)
 					res, err := client.Do(req)
 					require.NoError(t, err)
-					assert.Equal(t, http.StatusOK, res.StatusCode)
 
 					body := ioutilx.MustReadAll(res.Body)
+					require.Equalf(t, http.StatusOK, res.StatusCode, "%s", body)
+
 					assert.Equal(t, s.ID.String(), gjson.GetBytes(body, "id").String())
 					assert.Equal(t, tc.expectedIdentityId, gjson.GetBytes(body, "identity.id").String())
-					assert.Equal(t, fmt.Sprint(tc.expectedDevices), gjson.GetBytes(body, "devices.#").String())
+					assert.EqualValuesf(t, tc.expectedDevices, gjson.GetBytes(body, "devices.#").Int(), "%s", gjson.GetBytes(body, "devices").Raw)
 				})
 			}
 		})
@@ -569,7 +579,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 		})
 
 		t.Run("should redirect to public for whoami", func(t *testing.T) {
-			client := testhelpers.NewHTTPClientWithSessionToken(t, ctx, reg, s)
+			client := testhelpers.NewHTTPClientWithSessionToken(t.Context(), t, reg, s)
 			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			}
@@ -578,7 +588,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			res, err := client.Do(req)
 			require.NoError(t, err)
 			require.Equal(t, http.StatusTemporaryRedirect, res.StatusCode)
-			require.Equal(t, ts.URL+"/sessions/whoami", res.Header.Get("Location"))
+			require.Equal(t, public.URL+"/sessions/whoami", res.Header.Get("Location"))
 		})
 
 		assertPageToken := func(t *testing.T, id, linkHeader string) {
@@ -699,7 +709,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			client := testhelpers.NewClientWithCookies(t)
 
 			s.ExpiresAt = time.Now().Add(-time.Hour * 1)
-			require.NoError(t, reg.SessionPersister().UpsertSession(ctx, s))
+			require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), s))
 
 			assert.NotEqual(t, uuid.Nil, s.ID)
 			assert.NotEqual(t, uuid.Nil, s.Identity.ID)
@@ -720,10 +730,10 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			require.NoError(t, faker.FakeData(&s1))
 			s1.Active = true
 			s1.Identity.State = identity.StateInactive
-			require.NoError(t, reg.Persister().CreateIdentity(ctx, s1.Identity))
+			require.NoError(t, reg.Persister().CreateIdentity(t.Context(), s1.Identity))
 
 			assert.Equal(t, uuid.Nil, s1.ID)
-			require.NoError(t, reg.SessionPersister().UpsertSession(ctx, s1))
+			require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), s1))
 			assert.NotEqual(t, uuid.Nil, s1.ID)
 			assert.NotEqual(t, uuid.Nil, s1.Identity.ID)
 
@@ -742,7 +752,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, res.StatusCode)
 
-		_, err = reg.SessionPersister().GetSession(ctx, s.ID, ExpandNothing)
+		_, err = reg.SessionPersister().GetSession(t.Context(), s.ID, ExpandNothing)
 		require.True(t, errors.Is(err, sqlcon.ErrNoRows))
 
 		t.Run("should not list session", func(t *testing.T) {
@@ -780,7 +790,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
 		var i *identity.Identity
 		require.NoError(t, faker.FakeData(&i))
-		require.NoError(t, reg.Persister().CreateIdentity(ctx, i))
+		require.NoError(t, reg.Persister().CreateIdentity(t.Context(), i))
 
 		numSessions := 5
 		numSessionsActive := 2
@@ -791,12 +801,12 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			sess[j].Identity = i
 			if j < numSessionsActive {
 				sess[j].Active = true
-				sess[j].ExpiresAt = time.Now().Add(time.Hour)
+				sess[j].ExpiresAt = time.Now().UTC().Add(time.Hour)
 			} else {
 				sess[j].Active = false
-				sess[j].ExpiresAt = time.Now().Add(-time.Hour)
+				sess[j].ExpiresAt = time.Now().UTC().Add(-time.Hour)
 			}
-			require.NoError(t, reg.SessionPersister().UpsertSession(ctx, &sess[j]))
+			require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), &sess[j]))
 		}
 
 		for _, tc := range []struct {
@@ -817,8 +827,9 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("active=%#v", tc.activeOnly), func(t *testing.T) {
-				sessions, _, _ := reg.SessionPersister().ListSessionsByIdentity(ctx, i.ID, nil, 1, 10, uuid.Nil, ExpandEverything)
-				require.Equal(t, 5, len(sessions))
+				sessions, _, err := reg.SessionPersister().ListSessionsByIdentity(t.Context(), i.ID, nil, 1, 10, uuid.Nil, ExpandEverything)
+				require.NoError(t, err)
+				require.Len(t, sessions, 5)
 				assert.True(t, sort.IsSorted(sort.Reverse(byCreatedAt(sessions))))
 
 				reqURL := ts.URL + "/admin/identities/" + i.ID.String() + "/sessions"
@@ -845,23 +856,21 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 }
 
 func TestHandlerSelfServiceSessionManagement(t *testing.T) {
-	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	ts, _, r, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
+	t.Parallel()
 
-	// set this intermediate because kratos needs some valid url for CRUDE operations
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "http://example.com")
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/identity.schema.json")),
+	)
+	ts, _, r, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
 
 	var setup func(t *testing.T) (*http.Client, *identity.Identity, *Session)
 	{
 		// we limit the scope of the channels, so you cannot accidentally mess up a test case
 		ident := make(chan *identity.Identity, 1)
 		sess := make(chan *Session, 1)
-		r.GET("/set", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		r.GET("/set", func(w http.ResponseWriter, r *http.Request) {
 			h, s := testhelpers.MockSessionCreateHandlerWithIdentity(t, reg, <-ident)
-			h(w, r, ps)
+			h(w, r)
 			sess <- s
 		})
 
@@ -890,7 +899,7 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 			} else {
 				sess[j].Active = false
 			}
-			require.NoError(t, reg.SessionPersister().UpsertSession(ctx, &sess[j]))
+			require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), &sess[j]))
 		}
 
 		reqURL := ts.URL + "/sessions"
@@ -909,7 +918,7 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 		require.NoError(t, faker.FakeData(&otherSess))
 		otherSess.Identity = i
 		otherSess.Active = true
-		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, &otherSess))
+		require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), &otherSess))
 
 		req, _ := http.NewRequest("DELETE", ts.URL+"/sessions", nil)
 		res, err := client.Do(req)
@@ -919,11 +928,11 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), gjson.GetBytes(body, "count").Int(), "%s", body)
 
-		actualOther, err := reg.SessionPersister().GetSession(ctx, otherSess.ID, ExpandNothing)
+		actualOther, err := reg.SessionPersister().GetSession(t.Context(), otherSess.ID, ExpandNothing)
 		require.NoError(t, err)
 		assert.False(t, actualOther.Active)
 
-		actualCurr, err := reg.SessionPersister().GetSession(ctx, currSess.ID, ExpandNothing)
+		actualCurr, err := reg.SessionPersister().GetSession(t.Context(), currSess.ID, ExpandNothing)
 		require.NoError(t, err)
 		assert.True(t, actualCurr.Active)
 	})
@@ -936,7 +945,7 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 			require.NoError(t, faker.FakeData(&others[j]))
 			others[j].Identity = i
 			others[j].Active = true
-			require.NoError(t, reg.SessionPersister().UpsertSession(ctx, &others[j]))
+			require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), &others[j]))
 		}
 
 		req, _ := http.NewRequest("DELETE", ts.URL+"/sessions/"+others[0].ID.String(), nil)
@@ -944,10 +953,10 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, res.StatusCode)
 
-		actualOthers, total, err := reg.SessionPersister().ListSessionsByIdentity(ctx, i.ID, nil, 1, 10, uuid.Nil, ExpandNothing)
+		actualOthers, total, err := reg.SessionPersister().ListSessionsByIdentity(t.Context(), i.ID, nil, 1, 10, uuid.Nil, ExpandNothing)
 		require.NoError(t, err)
 		require.Len(t, actualOthers, 3)
-		require.Equal(t, int64(3), total)
+		require.EqualValues(t, 3, total)
 
 		for _, s := range actualOthers {
 			if s.ID == others[0].ID {
@@ -974,7 +983,7 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 		require.NoError(t, faker.FakeData(&otherSess))
 		otherSess.Identity = i
 		otherSess.Active = false
-		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, &otherSess))
+		require.NoError(t, reg.SessionPersister().UpsertSession(t.Context(), &otherSess))
 
 		for j, id := range []uuid.UUID{otherSess.ID, uuid.Must(uuid.NewV4())} {
 			req, _ := http.NewRequest("DELETE", ts.URL+"/sessions/"+id.String(), nil)
@@ -1034,14 +1043,12 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 }
 
 func TestHandlerRefreshSessionBySessionID(t *testing.T) {
-	ctx := context.Background()
-	conf, reg := internal.NewFastRegistryWithMocks(t)
-	publicServer, adminServer, _, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
+	t.Parallel()
 
-	// set this intermediate because kratos needs some valid url for CRUDE operations
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "http://example.com")
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, adminServer.URL)
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/identity.schema.json")),
+	)
+	publicServer, adminServer, _, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
 
 	i := identity.NewIdentity("")
 	require.NoError(t, reg.IdentityManager().Create(context.Background(), i))

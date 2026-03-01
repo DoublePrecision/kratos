@@ -13,14 +13,14 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/gobuffalo/httptest"
-	"github.com/julienschmidt/httprouter"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/hook"
@@ -34,8 +34,7 @@ func TestSettingsExecutor(t *testing.T) {
 		settings.StrategyProfile,
 	} {
 		t.Run("strategy="+strategy, func(t *testing.T) {
-
-			conf, reg := internal.NewFastRegistryWithMocks(t)
+			conf, reg := pkg.NewFastRegistryWithMocks(t)
 			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
 
@@ -47,9 +46,9 @@ func TestSettingsExecutor(t *testing.T) {
 
 			newServer := func(t *testing.T, i *identity.Identity, ft flow.Type) *httptest.Server {
 				t.Helper()
-				router := httprouter.New()
+				router := http.NewServeMux()
 				handleErr := testhelpers.SelfServiceHookSettingsErrorHandler
-				router.GET("/settings/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /settings/pre", func(w http.ResponseWriter, r *http.Request) {
 					if i == nil {
 						i = testhelpers.SelfServiceHookCreateFakeIdentity(t, reg)
 					}
@@ -57,12 +56,12 @@ func TestSettingsExecutor(t *testing.T) {
 
 					f, err := settings.NewFlow(conf, time.Minute, r, sess.Identity, ft)
 					require.NoError(t, err)
-					if handleErr(t, w, r, reg.SettingsHookExecutor().PreSettingsHook(r.Context(), w, r, f)) {
+					if handleErr(t, w, r, reg.SettingsHookExecutor().PreSettingsHook(r.Context(), w, r, f, sess)) {
 						_, _ = w.Write([]byte("ok"))
 					}
 				})
 
-				router.GET("/settings/post", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+				router.HandleFunc("GET /settings/post", func(w http.ResponseWriter, r *http.Request) {
 					if i == nil {
 						i = testhelpers.SelfServiceHookCreateFakeIdentity(t, reg)
 					}

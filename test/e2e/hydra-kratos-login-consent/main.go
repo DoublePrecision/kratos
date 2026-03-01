@@ -5,24 +5,16 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
-
-	"github.com/julienschmidt/httprouter"
 
 	"github.com/ory/hydra-client-go/client"
 	"github.com/ory/hydra-client-go/client/admin"
 	"github.com/ory/hydra-client-go/models"
 	kratos "github.com/ory/kratos-client-go"
 	"github.com/ory/x/osx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/urlx"
 )
-
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
 
 func checkReq(w http.ResponseWriter, err error) bool {
 	if err != nil {
@@ -33,16 +25,14 @@ func checkReq(w http.ResponseWriter, err error) bool {
 }
 
 func main() {
-	router := httprouter.New()
-
 	kratosPublicURL := urlx.ParseOrPanic(osx.GetenvDefault("KRATOS_PUBLIC_URL", "http://localhost:4433"))
 	adminURL := urlx.ParseOrPanic(osx.GetenvDefault("HYDRA_ADMIN_URL", "http://localhost:4445"))
 	hc := client.NewHTTPClientWithConfig(nil, &client.TransportConfig{Schemes: []string{adminURL.Scheme}, Host: adminURL.Host, BasePath: adminURL.Path})
 
-	router.GET("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	http.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`ok`))
 	})
-	router.GET("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	http.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) {
 		res, err := hc.Admin.GetLoginRequest(admin.NewGetLoginRequestParams().
 			WithLoginChallenge(r.URL.Query().Get("login_challenge")))
 		if !checkReq(w, err) {
@@ -51,8 +41,10 @@ func main() {
 		if *res.Payload.Skip {
 			res, err := hc.Admin.AcceptLoginRequest(admin.NewAcceptLoginRequestParams().
 				WithLoginChallenge(r.URL.Query().Get("login_challenge")).
-				WithBody(&models.AcceptLoginRequest{Remember: true, RememberFor: 3600,
-					Subject: res.Payload.Subject}))
+				WithBody(&models.AcceptLoginRequest{
+					Remember: true, RememberFor: 3600,
+					Subject: res.Payload.Subject,
+				}))
 			if !checkReq(w, err) {
 				return
 			}
@@ -73,7 +65,7 @@ func main() {
 </html>`, challenge)
 	})
 
-	router.POST("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	http.HandleFunc("POST /login", func(w http.ResponseWriter, r *http.Request) {
 		if !checkReq(w, r.ParseForm()) {
 			return
 		}
@@ -82,7 +74,8 @@ func main() {
 				WithLoginChallenge(r.URL.Query().Get("login_challenge")).
 				WithBody(&models.AcceptLoginRequest{
 					RememberFor: 3600, Remember: r.Form.Get("remember") == "true",
-					Subject: pointerx.String(r.Form.Get("username"))}))
+					Subject: new(r.Form.Get("username")),
+				}))
 			if !checkReq(w, err) {
 				return
 			}
@@ -98,7 +91,7 @@ func main() {
 		http.Redirect(w, r, *res.Payload.RedirectTo, http.StatusFound)
 	})
 
-	router.GET("/consent", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	http.HandleFunc("GET /consent", func(w http.ResponseWriter, r *http.Request) {
 		res, err := hc.Admin.GetConsentRequest(admin.NewGetConsentRequestParams().
 			WithConsentChallenge(r.URL.Query().Get("consent_challenge")))
 		if !checkReq(w, err) {
@@ -136,7 +129,7 @@ func main() {
 </html>`, challenge, checkoxes)
 	})
 
-	router.POST("/consent", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	http.HandleFunc("POST /consent", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		if r.Form.Get("action") == "accept" {
 			kratosConfig := kratos.NewConfiguration()
@@ -163,7 +156,8 @@ func main() {
 				WithBody(&models.AcceptConsentRequest{
 					Session:  &models.ConsentRequestSession{IDToken: idToken},
 					Remember: r.Form.Get("remember") == "true", RememberFor: 3600,
-					GrantScope: r.Form["scope"]}))
+					GrantScope: r.Form["scope"],
+				}))
 			if !checkReq(w, err) {
 				return
 			}
@@ -180,7 +174,6 @@ func main() {
 	})
 
 	addr := ":" + osx.GetenvDefault("PORT", "4746")
-	server := &http.Server{Addr: addr, Handler: router}
 	fmt.Printf("Starting web server at %s\n", addr)
-	check(server.ListenAndServe())
+	log.Fatal(http.ListenAndServe(addr, nil))
 }

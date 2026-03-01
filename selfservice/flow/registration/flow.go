@@ -10,10 +10,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ory/kratos/x/redir"
-
 	"github.com/gofrs/uuid"
-	"github.com/ory/pop/v6"
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 
@@ -24,6 +21,8 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/redir"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -127,6 +126,11 @@ type Flow struct {
 	IDToken string `json:"-" faker:"-" db:"-"`
 	// Only used internally
 	RawIDTokenNonce string `json:"-" db:"-"`
+
+	// IdentitySchema optionally holds the ID of the identity schema that is used
+	// for this flow. This value can be set by the user when creating the flow and
+	// should be retained when the flow is saved or converted to another flow.
+	IdentitySchema flow.IdentitySchema `json:"identity_schema,omitempty" faker:"-" db:"identity_schema_id"`
 }
 
 var _ flow.Flow = new(Flow)
@@ -152,6 +156,14 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 		return nil, err
 	}
 
+	identitySchema := ""
+	if requestedSchema := r.URL.Query().Get("identity_schema"); requestedSchema != "" {
+		identitySchema, err = conf.SelfServiceFlowIdentitySchema(r.Context(), requestedSchema)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &Flow{
 		ID:                   id,
 		OAuth2LoginChallenge: hlc,
@@ -166,20 +178,24 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 		Type:            ft,
 		InternalContext: []byte("{}"),
 		State:           flow.StateChooseMethod,
+		IdentitySchema:  flow.IdentitySchema(identitySchema),
 	}, nil
 }
 
-func (f Flow) TableName(context.Context) string {
-	return "selfservice_registration_flows"
-}
-
-func (f Flow) GetID() uuid.UUID {
-	return f.ID
-}
-
-func (f Flow) GetNID() uuid.UUID {
-	return f.NID
-}
+func (Flow) TableName() string                                { return "selfservice_registration_flows" }
+func (f Flow) GetID() uuid.UUID                               { return f.ID }
+func (f *Flow) AppendTo(src *url.URL) *url.URL                { return flow.AppendFlowTo(src, f.ID) }
+func (f *Flow) GetType() flow.Type                            { return f.Type }
+func (f *Flow) GetRequestURL() string                         { return f.RequestURL }
+func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage      { return f.InternalContext }
+func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage) { f.InternalContext = bytes }
+func (f *Flow) GetUI() *container.Container                   { return f.UI }
+func (f *Flow) GetState() State                               { return f.State }
+func (Flow) GetFlowName() flow.FlowName                       { return flow.RegistrationFlow }
+func (f *Flow) SetState(state State)                          { f.State = state }
+func (f *Flow) GetTransientPayload() json.RawMessage          { return f.TransientPayload }
+func (f *Flow) SetReturnToVerification(to string)             { f.ReturnToVerification = to }
+func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString     { return f.OAuth2LoginChallenge }
 
 func (f *Flow) Valid() error {
 	if f.ExpiresAt.Before(time.Now()) {
@@ -188,30 +204,10 @@ func (f *Flow) Valid() error {
 	return nil
 }
 
-func (f *Flow) AppendTo(src *url.URL) *url.URL {
-	return flow.AppendFlowTo(src, f.ID)
-}
-
-func (f *Flow) GetType() flow.Type {
-	return f.Type
-}
-
-func (f *Flow) GetRequestURL() string {
-	return f.RequestURL
-}
-
 func (f *Flow) EnsureInternalContext() {
 	if !gjson.ParseBytes(f.InternalContext).IsObject() {
 		f.InternalContext = []byte("{}")
 	}
-}
-
-func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage {
-	return f.InternalContext
-}
-
-func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage) {
-	f.InternalContext = bytes
 }
 
 func (f Flow) MarshalJSON() ([]byte, error) {
@@ -240,17 +236,11 @@ func (f *Flow) AfterSave(*pop.Connection) error {
 	return nil
 }
 
-func (f *Flow) GetUI() *container.Container {
-	return f.UI
-}
-
 func (f *Flow) AddContinueWith(c flow.ContinueWith) {
 	f.ContinueWithItems = append(f.ContinueWithItems, c)
 }
 
-func (f *Flow) ContinueWith() []flow.ContinueWith {
-	return f.ContinueWithItems
-}
+func (f *Flow) ContinueWith() []flow.ContinueWith { return f.ContinueWithItems }
 
 func (f *Flow) SecureRedirectToOpts(ctx context.Context, cfg config.Provider) (opts []redir.SecureRedirectOption) {
 	return []redir.SecureRedirectOption{
@@ -262,31 +252,11 @@ func (f *Flow) SecureRedirectToOpts(ctx context.Context, cfg config.Provider) (o
 	}
 }
 
-func (f *Flow) GetState() State {
-	return f.State
-}
-
-func (f *Flow) GetFlowName() flow.FlowName {
-	return flow.RegistrationFlow
-}
-
-func (f *Flow) SetState(state State) {
-	f.State = state
-}
-
-func (f *Flow) GetTransientPayload() json.RawMessage {
-	return f.TransientPayload
-}
-
-func (f *Flow) SetReturnToVerification(to string) {
-	f.ReturnToVerification = to
-}
-
-func (f *Flow) ToLoggerField() map[string]interface{} {
+func (f *Flow) ToLoggerField() map[string]any {
 	if f == nil {
-		return map[string]interface{}{}
+		return map[string]any{}
 	}
-	return map[string]interface{}{
+	return map[string]any{
 		"id":          f.ID.String(),
 		"return_to":   f.ReturnTo,
 		"request_url": f.RequestURL,
@@ -295,8 +265,4 @@ func (f *Flow) ToLoggerField() map[string]interface{} {
 		"nid":         f.NID,
 		"state":       f.State,
 	}
-}
-
-func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString {
-	return f.OAuth2LoginChallenge
 }

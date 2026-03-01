@@ -20,66 +20,69 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
-	"golang.org/x/oauth2"
-
-	"github.com/ory/kratos/selfservice/hook/hooktest"
-	"github.com/ory/x/sqlxx"
-	"github.com/ory/x/uuidx"
-
-	"github.com/ory/kratos/hydra"
-	"github.com/ory/kratos/selfservice/sessiontokenexchange"
-	"github.com/ory/kratos/session"
-	"github.com/ory/x/randx"
-	"github.com/ory/x/snapshotx"
-
-	"github.com/ory/kratos/text"
-
-	"github.com/ory/x/ioutilx"
-
-	"github.com/ory/x/assertx"
-
-	"github.com/ory/kratos/ui/container"
-
-	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
-
-	"github.com/ory/x/urlx"
+	"golang.org/x/oauth2"
 
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flow/registration"
-
+	"github.com/ory/kratos/selfservice/hook/hooktest"
+	"github.com/ory/kratos/selfservice/sessiontokenexchange"
 	"github.com/ory/kratos/selfservice/strategy/oidc"
+	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/text"
+	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/ioutilx"
+	"github.com/ory/x/randx"
+	"github.com/ory/x/snapshotx"
+	"github.com/ory/x/sqlxx"
+	"github.com/ory/x/urlx"
+	"github.com/ory/x/uuidx"
 )
 
 func TestStrategy(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	if testing.Short() {
-		t.Skip()
-	}
 
 	var (
-		conf, reg = internal.NewFastRegistryWithMocks(t)
-		subject   string
-		claims    idTokenClaims
-		scope     []string
+		subject string
+		claims  idTokenClaims
+		scope   []string
 	)
+
+	conf, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(map[string]any{
+			config.ViperKeyIdentitySchemas: config.Schemas{
+				{ID: "default", URL: "file://./stub/registration.schema.json"},
+				{ID: "email", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+				{ID: "phone", URL: "file://./stub/registration-phone.schema.json", SelfserviceSelectable: true},
+				{ID: "extra_data", URL: "file://./stub/registration-multi-schema-extra-fields.schema.json", SelfserviceSelectable: true},
+			},
+			config.ViperKeyDefaultIdentitySchemaID: "default",
+			config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypeOIDC.String()): []config.SelfServiceHook{{Name: "session"}},
+		}),
+	)
+
 	remoteAdmin, remotePublic, hydraIntegrationTSURL := newHydra(t, &subject, &claims, &scope)
-	returnTS := newReturnTs(t, reg)
-	conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTS.URL})
+	returnTS := newReturnTS(t, reg)
 	uiTS := newUI(t, reg)
 	errTS := testhelpers.NewErrorTestServer(t, reg)
-	routerP := x.NewRouterPublic()
-	routerA := x.NewRouterAdmin()
+	routerP, routerA := httprouterx.NewTestRouterPublic(t), httprouterx.NewTestRouterAdminWithPrefix(t)
 	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, routerP, routerA)
 	invalid := newOIDCProvider(t, ts, remotePublic, remoteAdmin, "invalid-issuer")
 
@@ -113,11 +116,6 @@ func TestStrategy(t *testing.T) {
 		},
 	)
 
-	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, true)
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
-	conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter,
-		identity.CredentialsTypeOIDC.String()), []config.SelfServiceHook{{Name: "session"}})
-
 	t.Logf("Kratos Public URL: %s", ts.URL)
 	t.Logf("Kratos Error URL: %s", errTS.URL)
 	t.Logf("Hydra Public URL: %s", remotePublic)
@@ -130,31 +128,31 @@ func TestStrategy(t *testing.T) {
 
 	// assert form values
 	assertFormValues := func(t *testing.T, flowID uuid.UUID, provider string) (action string) {
-		var config *container.Container
+		var cfg *container.Container
 		if req, err := reg.RegistrationFlowPersister().GetRegistrationFlow(context.Background(), flowID); err == nil {
 			require.EqualValues(t, req.ID, flowID)
-			config = req.UI
-			require.NotNil(t, config)
+			cfg = req.UI
+			require.NotNil(t, cfg)
 		} else if req, err := reg.LoginFlowPersister().GetLoginFlow(context.Background(), flowID); err == nil {
 			require.EqualValues(t, req.ID, flowID)
-			config = req.UI
-			require.NotNil(t, config)
+			cfg = req.UI
+			require.NotNil(t, cfg)
 		} else {
 			require.NoError(t, err)
 			return
 		}
 
-		assert.Equal(t, "POST", config.Method)
+		assert.Equal(t, "POST", cfg.Method)
 
 		var providers []interface{}
-		for _, nodes := range config.Nodes {
+		for _, nodes := range cfg.Nodes {
 			if strings.Contains(nodes.ID(), "provider") {
 				providers = append(providers, nodes.GetValue())
 			}
 		}
-		require.Contains(t, providers, provider, "%+v", assertx.PrettifyJSONPayload(t, config))
+		require.Contains(t, providers, provider, "%+v", assertx.PrettifyJSONPayload(t, cfg))
 
-		return config.Action
+		return cfg.Action
 	}
 
 	registerAction := func(flowID uuid.UUID) string {
@@ -174,7 +172,7 @@ func TestStrategy(t *testing.T) {
 		require.NoError(t, res.Body.Close())
 		require.NoError(t, err)
 
-		require.Equal(t, 200, res.StatusCode, "%s: %s\n\t%s", action, res.Request.URL.String(), body)
+		require.Equalf(t, 200, res.StatusCode, "%s: %s\n\t%s", action, res.Request.URL.String(), body)
 
 		return res, body
 	}
@@ -203,10 +201,15 @@ func TestStrategy(t *testing.T) {
 	}
 
 	makeAPICodeFlowRequest := func(t *testing.T, provider, action string, cookieJar *cookiejar.Jar) (returnToURL *url.URL) {
-		res, err := http.Post(action, "application/json", strings.NewReader(fmt.Sprintf(`{
+		res, err := http.Post( // #nosec G107 -- test code
+			action,
+			"application/json",
+			strings.NewReader(fmt.Sprintf(`
+{
 	"method": "oidc",
 	"provider": %q
-}`, provider)))
+}`, provider)),
+		)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
 		var changeLocation flow.BrowserLocationChangeRequiredError
@@ -385,19 +388,19 @@ func TestStrategy(t *testing.T) {
 			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
 		})
 		bc := testhelpers.NewDebugClient(t)
-		f := testhelpers.InitializeLoginFlowViaAPI(t, bc, ts, false)
+		f := testhelpers.InitializeLoginFlowViaAPICtx(t.Context(), t, bc, ts, false)
 
-		update, err := reg.LoginFlowPersister().GetLoginFlow(context.Background(), uuid.FromStringOrNil(f.Id))
+		update, err := reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
 		require.NoError(t, err)
 		update.RequestedAAL = identity.AuthenticatorAssuranceLevel2
-		require.NoError(t, reg.LoginFlowPersister().UpdateLoginFlow(context.Background(), update))
+		require.NoError(t, reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), update))
 
 		req, err := http.NewRequest("POST", f.Ui.Action, bytes.NewBufferString(`{"method":"oidc"}`))
 		require.NoError(t, err)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
 
-		actual, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, routerP.Router, req)
+		actual, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, routerP, req)
 		assert.Contains(t, res.Request.URL.String(), ts.URL+login.RouteSubmitFlow)
 		assert.Equal(t, text.NewErrorValidationLoginNoStrategyFound().Text, gjson.GetBytes(actual, "ui.messages.0.text").String())
 	})
@@ -418,7 +421,7 @@ func TestStrategy(t *testing.T) {
 		res, body := makeRequest(t, "valid", action, url.Values{})
 
 		require.Contains(t, res.Request.URL.String(), uiTS.URL, "%s", body)
-		assert.Contains(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.subject).messages.0.text").String(), "is not valid", "%s\n%s", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.subject)").Raw, body)
+		assert.Contains(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.subject).messages.0.text").String(), "Enter a valid email address", "%s\n%s", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.subject)").Raw, body)
 	})
 
 	t.Run("case=cannot register multiple accounts with the same OIDC account", func(t *testing.T) {
@@ -797,18 +800,27 @@ func TestStrategy(t *testing.T) {
 		postLoginWebhook.SetConfig(t, conf.GetProvider(ctx),
 			config.HookStrategyKey(config.ViperKeySelfServiceLoginAfter, config.HookGlobal))
 
+		conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+			{ID: "default", URL: "file://./stub/registration.schema.json"},
+			{ID: "email", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+			{ID: "phone", URL: "file://./stub/registration-phone.schema.json", SelfserviceSelectable: true},
+			{ID: "extra_data", URL: "file://./stub/registration-multi-schema-extra-fields.schema.json", SelfserviceSelectable: true},
+		})
+		conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "default")
+
 		subject = "login-without-register@ory.sh"
 		scope = []string{"openid"}
 
 		t.Run("case=should pass login", func(t *testing.T) {
 			transientPayload := `{"data": "login to registration"}`
 
-			r := newBrowserLoginFlow(t, returnTS.URL, time.Minute)
+			r := newBrowserLoginFlow(t, "https://example.com?identity_schema=phone", time.Minute)
 			action := assertFormValues(t, r.ID, "valid")
 			res, body := makeRequest(t, "valid", action, url.Values{
 				"transient_payload": {transientPayload},
 			})
 			assertIdentity(t, res, body)
+			assert.Equal(t, "phone", gjson.GetBytes(body, "identity.schema_id").String(), "%s", body)
 			assert.Equal(t, "valid", gjson.GetBytes(body, "authentication_methods.0.provider").String(), "%s", body)
 
 			assert.Empty(t, postLoginWebhook.LastBody,
@@ -967,9 +979,9 @@ func TestStrategy(t *testing.T) {
 				provider = "test-provider"
 			}
 			token = tc.idToken
-			token = strings.Replace(token, "{{sub}}", testhelpers.RandomEmail(), -1)
+			token = strings.ReplaceAll(token, "{{sub}}", testhelpers.RandomEmail())
 			nonce = randx.MustString(16, randx.Alpha)
-			token = strings.Replace(token, "{{nonce}}", nonce, -1)
+			token = strings.ReplaceAll(token, "{{nonce}}", nonce)
 			return
 		}
 
@@ -1171,7 +1183,7 @@ func TestStrategy(t *testing.T) {
 			scope = []string{"openid"}
 			conf.MustSet(ctx, config.ViperKeyOAuth2ProviderURL, "http://fake-hydra")
 
-			reg.WithHydra(hydra.NewFake())
+			reg.SetHydra(hydra.NewFake())
 			r := newBrowserLoginFlow(t, fmt.Sprintf("%s?login_challenge=%s", returnTS.URL, hydra.FakeValidLoginChallenge), time.Minute)
 			action := assertFormValues(t, r.ID, "valid")
 			fv := url.Values{}
@@ -1192,11 +1204,12 @@ func TestStrategy(t *testing.T) {
 			t.Cleanup(postRegistrationWebhook.Close)
 			postRegistrationWebhook.SetConfig(t, conf.GetProvider(ctx), config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypeOIDC.String()))
 
-			r := newBrowserRegistrationFlow(t, returnTS.URL, time.Minute)
+			r := newBrowserRegistrationFlow(t, returnTS.URL+"?identity_schema=phone", time.Minute)
 			action := assertFormValues(t, r.ID, "valid")
 			transientPayload := `{"data": "registration-one"}`
 			res, body := makeRequest(t, "valid", action, url.Values{"transient_payload": {transientPayload}})
 			assertIdentity(t, res, body)
+			assert.Equal(t, "phone", gjson.GetBytes(body, "identity.schema_id").String(), "%s", body)
 			postRegistrationWebhook.AssertTransientPayload(t, transientPayload)
 		})
 
@@ -1267,6 +1280,33 @@ func TestStrategy(t *testing.T) {
 					assert.Equal(t, "valid-name", gjson.GetBytes(body, "identity.traits.name").String(), "%s", body)
 					assert.Equal(t, "[\"group1\",\"group2\"]", gjson.GetBytes(body, "identity.traits.groups").String(), "%s", body)
 				})
+
+				// We need to make sure we use a different subject for the next test cases.
+				subject = "multi-" + subject
+
+				t.Run("case=should fail registration on first attempt with multi-schema select", func(t *testing.T) {
+					r := newBrowserRegistrationFlow(t, returnTS.URL+"?identity_schema=extra_data", time.Minute)
+					action := assertFormValues(t, r.ID, tc.provider)
+					res, body := makeRequest(t, tc.provider, action, url.Values{"traits.name": {"i"}})
+					require.Contains(t, res.Request.URL.String(), uiTS.URL, "%s", body)
+
+					assert.Equal(t, "length must be >= 2, but got 1", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.name).messages.0.text").String(), "%s", body) // make sure the field is being echoed
+					assert.Equal(t, "traits.name", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.name).attributes.name").String(), "%s", body)                    // make sure the field is being echoed
+					assert.Equal(t, "traits.extra_data", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.extra_data).attributes.name").String(), "%s", body)        // make sure the field is being echoed
+					assert.Equal(t, "i", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.name).attributes.value").String(), "%s", body)                             // make sure the field is being echoed
+					assert.Equal(t, "https://www.ory.sh/kratos", gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.website).attributes.value").String(), "%s", body)  // make sure the field is being echoed
+				})
+
+				t.Run("case=should pass registration with selected schema with valid data", func(t *testing.T) {
+					r := newBrowserRegistrationFlow(t, returnTS.URL+"?identity_schema=extra_data", time.Minute)
+					action := assertFormValues(t, r.ID, tc.provider)
+					res, body := makeRequest(t, tc.provider, action, url.Values{"traits.name": {"valid-name-2"}, "traits.extra_data": {"extra-data"}})
+					assertIdentity(t, res, body)
+					assert.Equal(t, "https://www.ory.sh/kratos", gjson.GetBytes(body, "identity.traits.website").String(), "%s", body)
+					assert.Equal(t, "valid-name-2", gjson.GetBytes(body, "identity.traits.name").String(), "%s", body)
+					assert.Equal(t, "extra-data", gjson.GetBytes(body, "identity.traits.extra_data").String(), "%s", body)
+					assert.Equal(t, "[\"group1\",\"group2\"]", gjson.GetBytes(body, "identity.traits.groups").String(), "%s", body)
+				})
 			})
 		}
 	})
@@ -1297,7 +1337,7 @@ func TestStrategy(t *testing.T) {
 				})
 
 				t.Run("case=should fail registration id_first strategy enabled", func(t *testing.T) {
-					conf.Set(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+					require.NoError(t, conf.Set(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first"))
 					r := newBrowserRegistrationFlow(t, returnTS.URL, time.Minute)
 					action := assertFormValues(t, r.ID, "valid")
 					_, body := makeRequest(t, "valid", action, url.Values{})
@@ -1332,7 +1372,7 @@ func TestStrategy(t *testing.T) {
 				})
 
 				t.Run("case=should fail registration id_first strategy enabled", func(t *testing.T) {
-					conf.Set(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+					require.NoError(t, conf.Set(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first"))
 					r := newBrowserRegistrationFlow(t, returnTS.URL, time.Minute)
 					action := assertFormValues(t, r.ID, "valid")
 					_, body := makeRequest(t, "valid", action, url.Values{})
@@ -1554,7 +1594,7 @@ func TestStrategy(t *testing.T) {
 			subject = "new-login-if-email-exist-with-password-strategy@ory.sh"
 			subject2 := "new-login-subject2@ory.sh"
 			scope = []string{"openid"}
-			password := "lwkj52sdkjf"
+			password := "lwkj52sdkjf" // #nosec G101
 
 			var i *identity.Identity
 			t.Run("step=create password identity", func(t *testing.T) {
@@ -1677,6 +1717,7 @@ func TestStrategy(t *testing.T) {
 			subject = email2
 			t.Run("step=should fail login if existing identity identifier doesn't match", func(t *testing.T) {
 				require.NotNil(t, linkingLoginFlow.ID)
+				require.NotEmpty(t, linkingLoginFlow.ID)
 				res, body := loginWithOIDC(t, client, uuid.Must(uuid.FromString(linkingLoginFlow.ID)), "valid")
 				assertUIError(t, res, body, "Linked credentials do not match.")
 			})
@@ -1690,7 +1731,6 @@ func TestStrategy(t *testing.T) {
 	})
 
 	t.Run("suite=auto link policy", func(t *testing.T) {
-
 		t.Run("case=should automatically link credential if policy says so", func(t *testing.T) {
 			subject = "user-in-org@ory.sh"
 			scope = []string{"openid"}
@@ -1709,7 +1749,10 @@ func TestStrategy(t *testing.T) {
 					Identifiers: []string{subject},
 					Config:      sqlxx.JSONRawMessage(`{}`),
 				})
-				i.OrganizationID = uuid.NullUUID{orgID, true}
+				i.OrganizationID = uuid.NullUUID{
+					UUID:  orgID,
+					Valid: true,
+				}
 				i.VerifiableAddresses = []identity.VerifiableAddress{{Value: subject, Via: "email", Verified: true}}
 				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(ctx, i))
 			})
@@ -1801,10 +1844,10 @@ func prettyJSON(t *testing.T, body []byte) string {
 }
 
 func TestCountActiveFirstFactorCredentials(t *testing.T) {
-	_, reg := internal.NewFastRegistryWithMocks(t)
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	strategy := oidc.NewStrategy(reg)
 
-	toJson := func(c identity.CredentialsOIDC) []byte {
+	toJSON := func(c identity.CredentialsOIDC) []byte {
 		out, err := json.Marshal(&c)
 		require.NoError(t, err)
 		return out
@@ -1823,7 +1866,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 		{
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type: strategy.ID(),
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1832,7 +1875,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{""},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1841,7 +1884,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"bar:"},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1850,7 +1893,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{":foo"},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1859,7 +1902,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"not-bar:foo"},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1868,7 +1911,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"bar:not-foo"},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1877,7 +1920,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 			in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
 				Type:        strategy.ID(),
 				Identifiers: []string{"bar:foo"},
-				Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+				Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 					{Subject: "foo", Provider: "bar"},
 				}}),
 			}},
@@ -1897,7 +1940,7 @@ func TestCountActiveFirstFactorCredentials(t *testing.T) {
 }
 
 func TestDisabledEndpoint(t *testing.T) {
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 	testhelpers.StrategyEnable(t, conf, identity.CredentialsTypeOIDC.String(), false)
 	ctx := context.Background()
 	publicTS, _ := testhelpers.NewKratosServer(t, reg)
@@ -1917,7 +1960,7 @@ func TestDisabledEndpoint(t *testing.T) {
 
 		t.Run("flow=settings", func(t *testing.T) {
 			testhelpers.SetDefaultIdentitySchema(conf, "file://stub/stub.schema.json")
-			c := testhelpers.NewHTTPClientWithArbitrarySessionCookie(t, ctx, reg)
+			c := testhelpers.NewHTTPClientWithArbitrarySessionCookie(ctx, t, reg)
 			f := testhelpers.InitializeSettingsFlowViaAPI(t, c, publicTS)
 
 			res, err := c.PostForm(f.Ui.Action, url.Values{"link": {"oidc"}})
@@ -1929,7 +1972,7 @@ func TestDisabledEndpoint(t *testing.T) {
 		})
 
 		t.Run("flow=login", func(t *testing.T) {
-			f := testhelpers.InitializeLoginFlowViaAPI(t, c, publicTS, false)
+			f := testhelpers.InitializeLoginFlowViaAPICtx(t.Context(), t, c, publicTS, false)
 			res, err := c.PostForm(f.Ui.Action, url.Values{"provider": {"oidc"}})
 			require.NoError(t, err)
 			assert.Equal(t, http.StatusNotFound, res.StatusCode)
@@ -1951,13 +1994,17 @@ func TestDisabledEndpoint(t *testing.T) {
 }
 
 func TestPostEndpointRedirect(t *testing.T) {
-	var (
-		conf, reg = internal.NewFastRegistryWithMocks(t)
-		subject   string
-		claims    idTokenClaims
-		scope     []string
+	t.Parallel()
+
+	conf, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.MethodEnableConfig(identity.CredentialsTypeOIDC, true)),
 	)
-	testhelpers.StrategyEnable(t, conf, identity.CredentialsTypeOIDC.String(), true)
+
+	var (
+		subject string
+		claims  idTokenClaims
+		scope   []string
+	)
 
 	remoteAdmin, remotePublic, _ := newHydra(t, &subject, &claims, &scope)
 
@@ -1969,25 +2016,25 @@ func TestPostEndpointRedirect(t *testing.T) {
 		newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "apple"),
 	)
 
-	for _, providerId := range []string{"apple", "apple-asd123"} {
-		t.Run("case=should redirect to GET and preserve parameters/id="+providerId, func(t *testing.T) {
+	for _, providerID := range []string{"apple", "apple-asd123"} {
+		t.Run("case=should redirect to GET and preserve parameters/id="+providerID, func(t *testing.T) {
 			// create a client that does not follow redirects
 			c := &http.Client{
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
 				},
 			}
-			res, err := c.PostForm(publicTS.URL+"/self-service/methods/oidc/callback/"+providerId, url.Values{"state": {"foo"}, "test": {"3"}})
+			res, err := c.PostForm(publicTS.URL+"/self-service/methods/oidc/callback/"+providerID, url.Values{"state": {"foo"}, "test": {"3"}})
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.Equal(t, http.StatusFound, res.StatusCode)
 
 			location, err := res.Location()
 			require.NoError(t, err)
-			assert.Equal(t, publicTS.URL+"/self-service/methods/oidc/callback/"+providerId+"?state=foo&test=3", location.String())
+			assert.Equal(t, publicTS.URL+"/self-service/methods/oidc/callback/"+providerID+"?state=foo&test=3", location.String())
 
 			// We don't want to add/override CSRF cookie when redirecting
-			testhelpers.AssertNoCSRFCookieInResponse(t, publicTS, c, res)
+			testhelpers.AssertNoCSRFCookieInResponse(t, res)
 		})
 	}
 }

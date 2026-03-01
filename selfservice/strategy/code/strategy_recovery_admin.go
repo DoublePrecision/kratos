@@ -9,11 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ory/kratos/x/redir"
-
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
-	"github.com/ory/pop/v6"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
 
@@ -24,9 +20,11 @@ import (
 	"github.com/ory/kratos/selfservice/strategy"
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
-	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/events"
+	"github.com/ory/kratos/x/redir"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/decoderx"
+	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/urlx"
 )
@@ -35,12 +33,12 @@ const (
 	RouteAdminCreateRecoveryCode = "/recovery/code"
 )
 
-func (s *Strategy) RegisterPublicRecoveryRoutes(public *x.RouterPublic) {
+func (s *Strategy) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	s.deps.CSRFHandler().IgnorePath(RouteAdminCreateRecoveryCode)
 	public.POST(RouteAdminCreateRecoveryCode, redir.RedirectToAdminRoute(s.deps))
 }
 
-func (s *Strategy) RegisterAdminRecoveryRoutes(admin *x.RouterAdmin) {
+func (s *Strategy) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	wrappedCreateRecoveryCode := strategy.IsDisabled(s.deps, s.RecoveryStrategyID(), s.createRecoveryCodeForIdentity)
 	admin.POST(RouteAdminCreateRecoveryCode, wrappedCreateRecoveryCode)
 }
@@ -139,9 +137,12 @@ type recoveryCodeForIdentity struct {
 //	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-admin-high
+func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.Request) {
 	var p createRecoveryCodeForIdentityBody
-	if err := s.dx.Decode(r, &p, decoderx.HTTPJSONDecoder()); err != nil {
+	if err := decoderx.Decode(r, &p, decoderx.HTTPJSONDecoder()); err != nil {
 		s.deps.Writer().WriteError(w, r, err)
 		return
 	}
@@ -176,7 +177,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 		return
 	}
 
-	recoveryFlow, err := recovery.NewFlow(config, expiresIn, s.deps.GenerateCSRFToken(r), r, s, flowType)
+	recoveryFlow, err := recovery.NewFlow(config, expiresIn, s.deps.GenerateCSRFToken(r), r, recovery.Strategies{s}, flowType)
 	if err != nil {
 		s.deps.Writer().WriteError(w, r, err)
 		return
@@ -230,7 +231,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 		events.NewRecoveryInitiatedByAdmin(ctx, recoveryFlow.ID, id.ID, flowType.String(), "code"),
 	)
 
-	s.deps.Audit().
+	s.deps.Logger().
 		WithField("identity_id", id.ID).
 		WithSensitiveField("recovery_code", rawCode).
 		Info("A recovery code has been created.")

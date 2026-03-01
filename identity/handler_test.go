@@ -18,20 +18,21 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/go-faker/faker/v4"
 	"github.com/gofrs/uuid"
 	"github.com/peterhellberg/link"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/ory/x/configx"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/hash"
 	"github.com/ory/kratos/identity"
-	"github.com/ory/kratos/internal"
-	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/ioutilx"
@@ -41,24 +42,25 @@ import (
 	"github.com/ory/x/urlx"
 )
 
+var ignoreDefault = []string{"id", "schema_url", "state_changed_at", "created_at", "updated_at"}
+
 func TestHandler(t *testing.T) {
-	conf, reg := internal.NewFastRegistryWithMocks(t)
+	t.Parallel()
+
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.IdentitySchemasConfig(map[string]string{
+			"default":         "file://./stub/identity.schema.json",
+			"customer":        "file://./stub/handler/customer.schema.json",
+			"multiple_emails": "file://./stub/handler/multiple_emails.schema.json",
+			"employee":        "file://./stub/handler/employee.schema.json",
+		})),
+	)
 
 	// Start kratos server
 	publicTS, adminTS := testhelpers.NewKratosServerWithCSRF(t, reg)
 
 	mockServerURL := urlx.ParseOrPanic(publicTS.URL)
 	defaultSchemaExternalURL := (&schema.Schema{ID: "default"}).SchemaURL(mockServerURL).String()
-
-	conf.MustSet(ctx, config.ViperKeyAdminBaseURL, adminTS.URL)
-	testhelpers.SetIdentitySchemas(t, conf, map[string]string{
-		"default":         "file://./stub/identity.schema.json",
-		"customer":        "file://./stub/handler/customer.schema.json",
-		"multiple_emails": "file://./stub/handler/multiple_emails.schema.json",
-		"employee":        "file://./stub/handler/employee.schema.json",
-	})
-
-	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, mockServerURL.String())
 
 	getFull := func(t *testing.T, base *httptest.Server, href string, expectCode int) (gjson.Result, *http.Response) {
 		t.Helper()
@@ -85,7 +87,7 @@ func TestHandler(t *testing.T) {
 
 		res, err := base.Client().Do(req)
 		require.NoError(t, err)
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 
 		require.EqualValues(t, expectCode, res.StatusCode, "%s", ioutilx.MustReadAll(res.Body))
 	}
@@ -196,7 +198,10 @@ func TestHandler(t *testing.T) {
 	t.Run("case=should create an identity with an organization ID", func(t *testing.T) {
 		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 			t.Run("endpoint="+name, func(t *testing.T) {
-				orgID := uuid.NullUUID{x.NewUUID(), true}
+				orgID := uuid.NullUUID{
+					UUID:  x.NewUUID(),
+					Valid: true,
+				}
 				i := identity.CreateIdentityBody{
 					Traits:         []byte(`{"bar":"baz"}`),
 					OrganizationID: orgID,
@@ -207,11 +212,27 @@ func TestHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("case=should create an identity with an external ID", func(t *testing.T) {
+		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+			t.Run("endpoint="+name, func(t *testing.T) {
+				externalID := x.NewUUID().String()
+				i := identity.CreateIdentityBody{
+					Traits:     []byte(`{"bar":"baz"}`),
+					ExternalID: externalID,
+				}
+				res := send(t, ts, "POST", "/identities", http.StatusCreated, &i)
+				assert.EqualValues(t, externalID, res.Get("external_id").String(), "%s", res.Raw)
+				res = get(t, ts, "/identities/by/external/"+externalID, http.StatusOK)
+				assert.EqualValues(t, externalID, res.Get("external_id").String(), "%s", res.Raw)
+			})
+		}
+	})
+
 	t.Run("case=should be able to import users", func(t *testing.T) {
 		ignoreDefault := []string{"id", "schema_url", "state_changed_at", "created_at", "updated_at"}
 		t.Run("without any credentials", func(t *testing.T) {
 			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, identity.CreateIdentityBody{Traits: []byte(`{"email": "import-1@ory.sh"}`)})
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(ignoreDefault...))
@@ -219,7 +240,7 @@ func TestHandler(t *testing.T) {
 
 		t.Run("without traits", func(t *testing.T) {
 			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, json.RawMessage("{}"))
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(ignoreDefault...))
@@ -257,7 +278,7 @@ func TestHandler(t *testing.T) {
 				},
 			})
 
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(append(ignoreDefault, "hashed_password")...), snapshotx.ExceptPaths("credentials.oidc.identifiers"))
@@ -272,7 +293,7 @@ func TestHandler(t *testing.T) {
 			assert.Contains(t, identifiers, "okta:import-saml-2")
 			assert.Contains(t, identifiers, "onelogin:import-saml-2")
 
-			require.NoError(t, hash.Compare(ctx, []byte("123456"), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
+			require.NoError(t, hash.Compare(t.Context(), []byte("123456"), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
 		})
 
 		t.Run("with organization oidc and saml credentials", func(t *testing.T) {
@@ -299,7 +320,7 @@ func TestHandler(t *testing.T) {
 				},
 			})
 
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(append(ignoreDefault, "hashed_password")...), snapshotx.ExceptPaths("credentials.oidc.identifiers"))
@@ -369,12 +390,12 @@ func TestHandler(t *testing.T) {
 							Config: identity.AdminIdentityImportCredentialsPasswordConfig{HashedPassword: tt.hash},
 						}},
 					})
-					actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+					actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 					require.NoError(t, err)
 
 					snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(ignoreDefault...), snapshotx.ExceptNestedKeys("hashed_password"))
 
-					require.NoError(t, hash.Compare(ctx, []byte(tt.pass), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
+					require.NoError(t, hash.Compare(t.Context(), []byte(tt.pass), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
 				})
 			}
 		})
@@ -386,7 +407,7 @@ func TestHandler(t *testing.T) {
 					Config: identity.AdminIdentityImportCredentialsPasswordConfig{UsePasswordMigrationHook: true},
 				}},
 			})
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(ignoreDefault...), snapshotx.ExceptNestedKeys("hashed_password"))
@@ -401,12 +422,12 @@ func TestHandler(t *testing.T) {
 				VerifiableAddresses: []identity.VerifiableAddress{{
 					Verified: true,
 					Value:    "UpperCased@ory.sh",
-					Via:      identity.VerifiableAddressTypeEmail,
+					Via:      identity.AddressTypeEmail,
 					Status:   identity.VerifiableAddressStatusCompleted,
 				}},
 				RecoveryAddresses: []identity.RecoveryAddress{{Value: "UpperCased@ory.sh"}},
 			})
-			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+			actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 			require.NoError(t, err)
 
 			require.Len(t, actual.VerifiableAddresses, 1)
@@ -433,7 +454,7 @@ func TestHandler(t *testing.T) {
 		var ids []uuid.UUID
 		identitiesAmount := 5
 		listAmount := 3
-		t.Run("case= create multiple identities", func(t *testing.T) {
+		t.Run("case=create multiple identities", func(t *testing.T) {
 			for i := 0; i < identitiesAmount; i++ {
 				res := send(t, adminTS, "POST", "/identities", http.StatusCreated, json.RawMessage(`{"traits": {"bar":"baz"}}`))
 				assert.NotEmpty(t, res.Get("id").String(), "%s", res.Raw)
@@ -493,7 +514,7 @@ func TestHandler(t *testing.T) {
 
 	t.Run("suite=create and update", func(t *testing.T) {
 		var i identity.Identity
-		createOidcIdentity := func(t *testing.T, identifier, accessToken, refreshToken, idToken string, encrypt bool) string {
+		createOIDCorSAMLIdentity := func(t *testing.T, ct identity.CredentialsType, identifier, accessToken, refreshToken, idToken string, encrypt bool) string {
 			transform := func(token, suffix string) string {
 				if !encrypt {
 					return token
@@ -501,25 +522,25 @@ func TestHandler(t *testing.T) {
 				if token == "" {
 					return ""
 				}
-				c, err := reg.Cipher(ctx).Encrypt(context.Background(), []byte(token+suffix))
+				c, err := reg.Cipher(t.Context()).Encrypt(context.Background(), []byte(token+suffix))
 				require.NoError(t, err)
 				return c
 			}
 
-			iId := x.NewUUID()
-			toJson := func(c identity.CredentialsOIDC) []byte {
+			iID := x.NewUUID()
+			toJSON := func(c identity.CredentialsOIDC) []byte {
 				out, err := json.Marshal(&c)
 				require.NoError(t, err)
 				return out
 			}
 			require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), &identity.Identity{
-				ID:     iId,
+				ID:     iID,
 				Traits: identity.Traits(fmt.Sprintf(`{"subject":"%s"}`, identifier)),
 				Credentials: map[identity.CredentialsType]identity.Credentials{
-					identity.CredentialsTypeOIDC: {
-						Type:        identity.CredentialsTypeOIDC,
+					ct: {
+						Type:        ct,
 						Identifiers: []string{"bar:" + identifier},
-						Config: toJson(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
+						Config: toJSON(identity.CredentialsOIDC{Providers: []identity.CredentialsOIDCProvider{
 							{
 								Subject:             "foo",
 								Provider:            "bar",
@@ -547,12 +568,13 @@ func TestHandler(t *testing.T) {
 						Value:      identifier,
 						Verified:   false,
 						CreatedAt:  time.Now(),
-						IdentityID: iId,
+						IdentityID: iID,
 					},
 				},
 			}))
-			return iId.String()
+			return iID.String()
 		}
+
 		t.Run("case=should create an identity with an ID which is ignored", func(t *testing.T) {
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
@@ -605,6 +627,11 @@ func TestHandler(t *testing.T) {
 						Identifiers: []string{"ProviderID:293b5d9b-1009-4600-a3e9-bd1845de22f2"},
 						Config:      sqlxx.JSONRawMessage("{\"some\" : \"secret\"}"),
 					},
+					identity.CredentialsTypeSAML: {
+						Type:        identity.CredentialsTypeSAML,
+						Identifiers: []string{"SAMLProviderID:0851ac66-88cc-4775-aee0-9b4c79fdbfb9"},
+						Config:      sqlxx.JSONRawMessage("{\"saml\" : \"secret\"}"),
+					},
 				},
 				State:  identity.StateActive,
 				Traits: identity.Traits(`{"username":"find.by.identifier@bar.com"}`),
@@ -631,13 +658,24 @@ func TestHandler(t *testing.T) {
 				assert.EqualValues(t, config.DefaultIdentityTraitsSchemaID, res.Get("0.schema_id").String(), "%s", res.Raw)
 				assert.EqualValues(t, identity.StateActive, res.Get("0.state").String(), "%s", res.Raw)
 				assert.EqualValues(t, "oidc", res.Get("0.credentials.oidc.type").String(), res.Raw)
-				assert.EqualValues(t, "1", res.Get("0.credentials.oidc.identifiers.#").String(), res.Raw)
+				require.Len(t, res.Get("0.credentials.oidc.identifiers").Array(), 1, res.Raw)
 				assert.EqualValues(t, "ProviderID:293b5d9b-1009-4600-a3e9-bd1845de22f2", res.Get("0.credentials.oidc.identifiers.0").String(), res.Raw)
+			})
+			t.Run("type=oidc", func(t *testing.T) {
+				res := get(t, adminTS, "/identities?credentials_identifier=SAMLProviderID:0851ac66-88cc-4775-aee0-9b4c79fdbfb9", http.StatusOK)
+				assert.EqualValues(t, ident.ID.String(), res.Get("0.id").String(), "%s", res.Raw)
+				assert.EqualValues(t, "find.by.identifier@bar.com", res.Get("0.traits.username").String(), "%s", res.Raw)
+				assert.EqualValues(t, defaultSchemaExternalURL, res.Get("0.schema_url").String(), "%s", res.Raw)
+				assert.EqualValues(t, config.DefaultIdentityTraitsSchemaID, res.Get("0.schema_id").String(), "%s", res.Raw)
+				assert.EqualValues(t, identity.StateActive, res.Get("0.state").String(), "%s", res.Raw)
+				assert.EqualValues(t, "saml", res.Get("0.credentials.saml.type").String(), res.Raw)
+				assert.Len(t, res.Get("0.credentials.saml.identifiers").Array(), 1, res.Raw)
+				assert.EqualValues(t, "SAMLProviderID:0851ac66-88cc-4775-aee0-9b4c79fdbfb9", res.Get("0.credentials.saml.identifiers.0").String(), res.Raw)
 			})
 		})
 
 		t.Run("case=should get oidc credential", func(t *testing.T) {
-			id := createOidcIdentity(t, "foo.oidc@bar.com", "access_token", "refresh_token", "id_token", true)
+			id := createOIDCorSAMLIdentity(t, identity.CredentialsTypeOIDC, "foo.oidc@bar.com", "access_token", "refresh_token", "id_token", true)
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
 					res := get(t, ts, "/identities/"+id, http.StatusOK)
@@ -648,8 +686,9 @@ func TestHandler(t *testing.T) {
 					assert.True(t, res.Get("credentials").Exists(), "credentials should be included: %s", res.Raw)
 					assert.True(t, res.Get("credentials.password").Exists(), "password meta should be included: %s", res.Raw)
 					assert.False(t, res.Get("credentials.password.false").Exists(), "password credentials should not be included: %s", res.Raw)
-					assert.True(t, res.Get("credentials.oidc.config").Exists(), "oidc credentials should be included: %s", res.Raw)
+					assert.Equal(t, "bar:foo.oidc@bar.com", res.Get("credentials.oidc.identifiers.0").Str)
 
+					assert.True(t, res.Get("credentials.oidc.config").Exists(), "oidc credentials should be included: %s", res.Raw)
 					assert.EqualValues(t, "foo", res.Get("credentials.oidc.config.providers.0.subject").String(), "credentials should be included: %s", res.Raw)
 					assert.EqualValues(t, "bar", res.Get("credentials.oidc.config.providers.0.provider").String(), "credentials should be included: %s", res.Raw)
 					assert.EqualValues(t, "access_token0", res.Get("credentials.oidc.config.providers.0.initial_access_token").String(), "credentials should be included: %s", res.Raw)
@@ -664,8 +703,40 @@ func TestHandler(t *testing.T) {
 			}
 		})
 
+		t.Run("case=should get saml credential", func(t *testing.T) {
+			id := createOIDCorSAMLIdentity(t, identity.CredentialsTypeSAML, "foo.saml@bar.com", "access_token", "refresh_token", "id_token", true)
+			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+				t.Run("endpoint="+name, func(t *testing.T) {
+					res := get(t, ts, "/identities/"+id, http.StatusOK)
+					assert.False(t, res.Get("credentials.saml.config").Exists(), "credentials config should be omitted: %s", res.Raw)
+					assert.False(t, res.Get("credentials.password.config").Exists(), "credentials config should be omitted: %s", res.Raw)
+
+					res = get(t, ts, "/identities/"+id+"?include_credential=saml", http.StatusOK)
+					assert.True(t, res.Get("credentials").Exists(), "credentials should be included: %s", res.Raw)
+					assert.True(t, res.Get("credentials.password").Exists(), "password meta should be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.password.false").Exists(), "password credentials should not be included: %s", res.Raw)
+
+					assert.Equal(t, "bar:foo.saml@bar.com", res.Get("credentials.saml.identifiers.0").Str)
+					assert.True(t, res.Get("credentials.saml.config").Exists(), "SAML config should be included: %s", res.Raw)
+
+					assert.True(t, res.Get("credentials.saml.config").Exists(), "saml credentials should be included: %s", res.Raw)
+					assert.EqualValues(t, "foo", res.Get("credentials.saml.config.providers.0.subject").String(), "credentials should be included: %s", res.Raw)
+					assert.EqualValues(t, "bar", res.Get("credentials.saml.config.providers.0.provider").String(), "credentials should be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.0.initial_access_token").Exists(), "SAML details should not be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.0.initial_refresh_token").Exists(), "SAML details should not be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.0.initial_id_token").Exists(), "SAML details should not be included: %s", res.Raw)
+
+					assert.EqualValues(t, "baz", res.Get("credentials.saml.config.providers.1.subject").String(), "credentials should be included: %s", res.Raw)
+					assert.EqualValues(t, "zab", res.Get("credentials.saml.config.providers.1.provider").String(), "credentials should be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.1.initial_access_token").Exists(), "SAML details should not be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.1.initial_refresh_token").Exists(), "SAML details should not be included: %s", res.Raw)
+					assert.False(t, res.Get("credentials.saml.config.providers.1.initial_id_token").Exists(), "SAML details should not be included: %s", res.Raw)
+				})
+			}
+		})
+
 		t.Run("case=should not fail on empty tokens", func(t *testing.T) {
-			id := createOidcIdentity(t, "foo.oidc.empty-tokens@bar.com", "", "", "", true)
+			id := createOIDCorSAMLIdentity(t, identity.CredentialsTypeOIDC, "foo.oidc.empty-tokens@bar.com", "", "", "", true)
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
 					res := get(t, ts, "/identities/"+id, http.StatusOK)
@@ -736,7 +807,7 @@ func TestHandler(t *testing.T) {
 		})
 
 		t.Run("case=should return empty tokens if decryption fails", func(t *testing.T) {
-			id := createOidcIdentity(t, "foo-failed.oidc@bar.com", "foo_token", "bar_token", "id_token", false)
+			id := createOIDCorSAMLIdentity(t, identity.CredentialsTypeOIDC, "foo-failed.oidc@bar.com", "foo_token", "bar_token", "id_token", false)
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
 					res := get(t, ts, "/identities/"+i.ID.String()+"?include_credential=oidc", http.StatusOK)
@@ -752,8 +823,8 @@ func TestHandler(t *testing.T) {
 		})
 
 		t.Run("case=should return decrypted token", func(t *testing.T) {
-			e, _ := reg.Cipher(ctx).Encrypt(context.Background(), []byte("foo_token"))
-			id := createOidcIdentity(t, "foo-failed-2.oidc@bar.com", e, "bar_token", "id_token", false)
+			e, _ := reg.Cipher(t.Context()).Encrypt(context.Background(), []byte("foo_token"))
+			id := createOIDCorSAMLIdentity(t, identity.CredentialsTypeOIDC, "foo-failed-2.oidc@bar.com", e, "bar_token", "id_token", false)
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
 					t.Logf("no oidc token")
@@ -774,12 +845,14 @@ func TestHandler(t *testing.T) {
 
 			for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 				t.Run("endpoint="+name, func(t *testing.T) {
+					externalID := x.NewUUID().String()
 					ur := identity.UpdateIdentityBody{
 						Traits:         []byte(`{"bar":"baz","foo":"baz"}`),
 						SchemaID:       i.SchemaID,
 						State:          identity.StateInactive,
 						MetadataPublic: []byte(`{"public":"metadata"}`),
 						MetadataAdmin:  []byte(`{"admin":"metadata"}`),
+						ExternalID:     externalID,
 					}
 
 					res := send(t, ts, "PUT", "/identities/"+i.ID.String(), http.StatusOK, &ur)
@@ -789,6 +862,7 @@ func TestHandler(t *testing.T) {
 					assert.EqualValues(t, "metadata", res.Get("metadata_public.public").String(), "%s", res.Raw)
 					assert.EqualValues(t, identity.StateInactive, res.Get("state").String(), "%s", res.Raw)
 					assert.NotEqualValues(t, i.StateChangedAt, sqlxx.NullTime(res.Get("state_changed_at").Time()), "%s", res.Raw)
+					assert.Equal(t, externalID, res.Get("external_id").String(), "%s", res.Raw)
 
 					res = get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
 					assert.EqualValues(t, i.ID.String(), res.Get("id").String(), "%s", res.Raw)
@@ -797,6 +871,7 @@ func TestHandler(t *testing.T) {
 					assert.EqualValues(t, "metadata", res.Get("metadata_public.public").String(), "%s", res.Raw)
 					assert.EqualValues(t, identity.StateInactive, res.Get("state").String(), "%s", res.Raw)
 					assert.NotEqualValues(t, i.StateChangedAt, sqlxx.NullTime(res.Get("state_changed_at").Time()), "%s", res.Raw)
+					assert.Equal(t, externalID, res.Get("external_id").String(), "%s", res.Raw)
 				})
 			}
 		})
@@ -839,7 +914,7 @@ func TestHandler(t *testing.T) {
 					assert.NotEqualValues(t, i.StateChangedAt, sqlxx.NullTime(res.Get("state_changed_at").Time()), "%s", res.Raw)
 					actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(context.Background(), i.ID)
 					require.NoError(t, err)
-					require.NoError(t, hash.Compare(ctx, []byte("pswd1234"), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
+					require.NoError(t, hash.Compare(t.Context(), []byte("pswd1234"), []byte(gjson.GetBytes(actual.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())))
 				})
 			}
 		})
@@ -999,7 +1074,7 @@ func TestHandler(t *testing.T) {
 				var identityIDs []uuid.UUID
 				require.NoErrorf(t, json.Unmarshal(([]byte)(body.Get("identities.#.identity").Raw), &identityIDs), "%s", body)
 
-				actualIdentities, _, err := reg.Persister().ListIdentities(ctx, identity.ListIdentityParameters{IdsFilter: identityIDs})
+				actualIdentities, _, err := reg.Persister().ListIdentities(t.Context(), identity.ListIdentityParameters{IdsFilter: identityIDs})
 				require.NoError(t, err)
 				actualIdentityIDs := make([]uuid.UUID, len(actualIdentities))
 				for i, id := range actualIdentities {
@@ -1124,6 +1199,51 @@ func TestHandler(t *testing.T) {
 				assert.False(t, res.Get("metadata_public.public").Exists(), "%s", res.Raw)
 				assert.EqualValues(t, identity.StateInactive, res.Get("state").String(), "%s", res.Raw)
 				assert.NotEqualValues(t, i.StateChangedAt, sqlxx.NullTime(res.Get("state_changed_at").Time()), "%s", res.Raw)
+			})
+		}
+	})
+
+	t.Run("case=PATCH update external_id", func(t *testing.T) {
+		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+			id := x.NewUUID().String()
+			externalID1 := x.NewUUID().String()
+			externalID2 := x.NewUUID().String()
+			email := "UPPER" + id + "@ory.sh"
+			i := &identity.Identity{Traits: identity.Traits(fmt.Sprintf(`{"subject": %q, "email": %q}`, id, email))}
+			require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+
+			t.Run("endpoint="+name, func(t *testing.T) {
+				res := get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
+				assert.Empty(t, res.Get("external_id").String(), "%s", res.Raw)
+
+				t.Run("set external_id works", func(t *testing.T) {
+					res = send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusOK,
+						&[]patch{{"op": "replace", "path": "/external_id", "value": externalID1}})
+					assert.EqualValues(t, externalID1, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
+					assert.EqualValues(t, externalID1, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/by/external/"+externalID1, http.StatusOK)
+					assert.EqualValues(t, externalID1, res.Get("external_id").String(), "%s", res.Raw)
+				})
+
+				t.Run("set external_id to empty clears it", func(t *testing.T) {
+					res = send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusOK,
+						&[]patch{{"op": "replace", "path": "/external_id", "value": ""}})
+					assert.Empty(t, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
+					assert.Empty(t, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/by/external/"+externalID1, http.StatusNotFound)
+				})
+
+				t.Run("set external_id again works", func(t *testing.T) {
+					res = send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusOK,
+						&[]patch{{"op": "replace", "path": "/external_id", "value": externalID2}})
+					assert.EqualValues(t, externalID2, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
+					assert.EqualValues(t, externalID2, res.Get("external_id").String(), "%s", res.Raw)
+					res = get(t, ts, "/identities/by/external/"+externalID2, http.StatusOK)
+					assert.EqualValues(t, externalID2, res.Get("external_id").String(), "%s", res.Raw)
+				})
 			})
 		}
 	})
@@ -1384,17 +1504,15 @@ func TestHandler(t *testing.T) {
 	})
 
 	t.Run("case=PATCH should allow to update credential password", func(t *testing.T) {
-		email := x.NewUUID().String() + "@ory.sh"
-		password := "ljanf123akf"
-		p, err := reg.Hasher(ctx).Generate(context.Background(), []byte(password))
-		require.NoError(t, err)
+		email := uuid.NewV5(uuid.Nil, t.Name()).String() + "@ory.sh"
 		i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
 		i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
 			Type:        identity.CredentialsTypePassword,
 			Identifiers: []string{email},
-			Config:      sqlxx.JSONRawMessage(`{"hashed_password":"` + string(p) + `"}`),
+			Config:      sqlxx.JSONRawMessage(`{"hashed_password": "secret", "some-random-key":" some-random-value"}`),
 		})
 		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+		snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*i), snapshotx.ExceptNestedKeys(ignoreDefault...))
 
 		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 			t.Run("endpoint="+name, func(t *testing.T) {
@@ -1404,10 +1522,11 @@ func TestHandler(t *testing.T) {
 
 				send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusOK, &patch)
 
-				updated, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, i.ID)
+				updated, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
 				require.NoError(t, err)
 				assert.Equal(t, "foo",
 					gjson.GetBytes(updated.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())
+				snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*updated), snapshotx.ExceptNestedKeys(ignoreDefault...))
 			})
 		}
 	})
@@ -1419,7 +1538,7 @@ func TestHandler(t *testing.T) {
 			t.Helper()
 			email := x.NewUUID().String() + "@ory.sh"
 			password := "ljanf123akf"
-			p, err := reg.Hasher(ctx).Generate(context.Background(), []byte(password))
+			p, err := reg.Hasher(t.Context()).Generate(context.Background(), []byte(password))
 			require.NoError(t, err)
 			i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
 			i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
@@ -1734,7 +1853,7 @@ func TestHandler(t *testing.T) {
 				t.Run("endpoint="+name, func(t *testing.T) {
 					orgID := uuid.Must(uuid.NewV4())
 					email := x.NewUUID().String() + "@ory.sh"
-					require.NoError(t, reg.IdentityManager().Create(ctx, &identity.Identity{
+					require.NoError(t, reg.IdentityManager().Create(t.Context(), &identity.Identity{
 						Traits:         identity.Traits(`{"email":"` + email + `"}`),
 						OrganizationID: uuid.NullUUID{UUID: orgID, Valid: true},
 					}))
@@ -1768,13 +1887,36 @@ func TestHandler(t *testing.T) {
 
 	t.Run("case=should list all identities with credentials", func(t *testing.T) {
 		t.Run("include_credential=oidc should include OIDC credentials config", func(t *testing.T) {
-			res := get(t, adminTS, "/identities?include_credential=oidc&credentials_identifier=bar:foo.oidc@bar.com", http.StatusOK)
-			assert.True(t, res.Get("0.credentials.oidc.config").Exists(), "credentials config should be included: %s", res.Raw)
-			snapshotx.SnapshotT(t, res.Get("0.credentials.oidc.config").String())
+			res := get(t, adminTS, "/identities?include_credential=oidc", http.StatusOK)
+			require.True(t, res.IsArray())
+			require.GreaterOrEqual(t, len(res.Array()), 2)
+			var foundOIDC, foundSAML bool
+			for _, id := range res.Array() {
+				if id.Get("credentials.oidc.identifiers.0").Str == "bar:foo.oidc@bar.com" {
+					foundOIDC = true
+					snapshotx.SnapshotT(t, id.Get("credentials.oidc.config").String())
+				}
+				if id.Get("credentials.saml.identifiers.0").Str == "bar:foo.saml@bar.com" {
+					foundSAML = true
+					assert.False(t, id.Get("credentials.saml.config").Exists(), "SAML config is not included")
+				}
+			}
+			assert.True(t, foundOIDC, "OIDC credential included")
+			assert.True(t, foundSAML, "SAML credential included")
+		})
+
+		t.Run("include_credential=saml should not include SAML credentials config", func(t *testing.T) {
+			res := get(t, adminTS, "/identities?include_credential=saml", http.StatusOK)
+			t.Log("Result:", res)
+			assert.Empty(t, res.Get("0.credentials.saml.config"), "SAML config should not be included")
 		})
 		t.Run("include_credential=totp should not include OIDC credentials config", func(t *testing.T) {
-			res := get(t, adminTS, "/identities?include_credential=totp&credentials_identifier=bar:foo.oidc@bar.com", http.StatusOK)
-			assert.False(t, res.Get("0.credentials.oidc.config").Exists(), "credentials config should be included: %s", res.Raw)
+			res := get(t, adminTS, "/identities?include_credential=totp", http.StatusOK)
+			t.Log("Result:", res)
+			for _, id := range res.Array() {
+				assert.False(t, id.Get("credentials.oidc.config").Exists(), "OIDC config should not be included")
+				assert.False(t, id.Get("credentials.saml.config").Exists(), "SAML config should not be included")
+			}
 		})
 	})
 
@@ -1823,7 +1965,6 @@ func TestHandler(t *testing.T) {
 	})
 
 	t.Run("case=should delete credential of a specific user and no longer be able to retrieve it", func(t *testing.T) {
-		ignoreDefault := []string{"id", "schema_url", "state_changed_at", "created_at", "updated_at"}
 		type M = map[identity.CredentialsType]identity.Credentials
 		createIdentity := func(creds M) func(*testing.T) *identity.Identity {
 			return func(t *testing.T) *identity.Identity {
@@ -1874,7 +2015,7 @@ func TestHandler(t *testing.T) {
 					},
 				})(t)
 				remove(t, ts, "/identities/"+i.ID.String()+"/credentials/password", http.StatusNoContent)
-				actual, creds, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, identity.CredentialsTypePassword, pwIdentifier)
+				actual, creds, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(t.Context(), identity.CredentialsTypePassword, pwIdentifier)
 				require.NoError(t, err)
 				assert.Equal(t, "{}", string(creds.Config))
 				assert.Equal(t, i.ID, actual.ID)
@@ -1942,6 +2083,77 @@ func TestHandler(t *testing.T) {
 				assert.EqualValues(t, oidConfig.Get("providers.1.provider").String(), "google", "%s", res.Raw)
 				assert.EqualValues(t, oidConfig.Get("providers.1.subject").String(), googleSubject, "%s", res.Raw)
 			})
+			t.Run("type=remove saml type/"+name, func(t *testing.T) {
+				// force ordering among identifiers
+				entraSubject1 := "0" + randx.MustString(7, randx.Numeric)
+				entraSubject2 := "1" + randx.MustString(7, randx.Numeric)
+				oktaSubject := randx.MustString(8, randx.Numeric)
+				initialConfig := []byte(fmt.Sprintf(`{
+					"providers": [
+						{
+							"subject": %q,
+							"provider": "entra"
+						},
+						{
+							"subject": %q,
+							"provider": "entra"
+						},
+						{
+							"subject": %q,
+							"provider": "okta"
+						}
+					]
+				}`, entraSubject1, entraSubject2, oktaSubject))
+				identifiers := []string{
+					identity.OIDCUniqueID("entra", entraSubject1),
+					identity.OIDCUniqueID("entra", entraSubject2),
+					identity.OIDCUniqueID("okta", oktaSubject),
+				}
+				i := createIdentity(M{
+					identity.CredentialsTypePassword: {
+						Identifiers: []string{x.NewUUID().String()},
+						Config:      []byte(`{"hashed_password":"$2a$08$.cOYmAd.vCpDOoiVJrO5B.hjTLKQQ6cAK40u8uB.FnZDyPvVvQ9Q."}`), // foobar
+					},
+					identity.CredentialsTypeWebAuthn: {
+						Identifiers: []string{x.NewUUID().String()},
+						Config:      []byte(`{"credentials":[{"is_passwordless":true}]}`),
+					},
+					identity.CredentialsTypeSAML: {
+						Identifiers: identifiers,
+						Config:      initialConfig,
+					},
+				})(t)
+				res := get(t, ts, "/identities/"+i.ID.String()+"?include_credential=saml", http.StatusOK)
+				assert.EqualValues(t, i.ID.String(), res.Get("id").String(), "%s", res.Raw)
+				assert.Len(t, res.Get("credentials.saml.identifiers").Array(), 3, "%s", res.Raw)
+				assert.EqualValues(t, res.Get("credentials.saml.identifiers.0").String(), identifiers[0], "%s", res.Raw)
+				assert.EqualValues(t, res.Get("credentials.saml.identifiers.1").String(), identifiers[1], "%s", res.Raw)
+				assert.EqualValues(t, res.Get("credentials.saml.identifiers.2").String(), identifiers[2], "%s", res.Raw)
+
+				oidConfig := gjson.Parse(res.Get("credentials.saml.config").String())
+				assert.Len(t, res.Get("credentials.saml.identifiers").Array(), 3, "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.0.provider").String(), "entra", "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.0.subject").String(), entraSubject1, "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.1.provider").String(), "entra", "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.1.subject").String(), entraSubject2, "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.2.provider").String(), "okta", "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.2.subject").String(), oktaSubject, "%s", res.Raw)
+
+				remove(t, ts, "/identities/"+i.ID.String()+"/credentials/saml?identifier="+identifiers[1], http.StatusNoContent)
+				res = get(t, ts, "/identities/"+i.ID.String()+"?include_credential=saml", http.StatusOK)
+
+				assert.EqualValues(t, i.ID.String(), res.Get("id").String(), "%s", res.Raw)
+				assert.Len(t, res.Get("credentials.saml.identifiers").Array(), 2, "%s", res.Raw)
+				assert.EqualValues(t, res.Get("credentials.saml.identifiers.0").String(), identifiers[0], "%s", res.Raw)
+				assert.EqualValues(t, res.Get("credentials.saml.identifiers.1").String(), identifiers[2], "%s", res.Raw)
+
+				oidConfig = gjson.Parse(res.Get("credentials.saml.config").String())
+				assert.Len(t, res.Get("credentials.saml.identifiers").Array(), 2, "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.0.provider").String(), "entra", "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.0.subject").String(), entraSubject1, "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.1.provider").String(), "okta", "%s", res.Raw)
+				assert.EqualValues(t, oidConfig.Get("providers.1.subject").String(), oktaSubject, "%s", res.Raw)
+			})
 			t.Run("type=remove webauthn passwordless type/"+name, func(t *testing.T) {
 				expected := `{"credentials":[{"id":"THTndqZP5Mjvae1BFvJMaMfEMm7O7HE1ju+7PBaYA7Y=","added_at":"2022-12-16T14:11:55Z","public_key":"pQECAyYgASFYIMJLQhJxQRzhnKPTcPCUODOmxYDYo2obrm9bhp5lvSZ3IlggXjhZvJaPUqF9PXqZqTdWYPR7R+b2n/Wi+IxKKXsS4rU=","display_name":"test","authenticator":{"aaguid":"rc4AAjW8xgpkiwsl8fBVAw==","sign_count":0,"clone_warning":false},"is_passwordless":true,"attestation_type":"none"}],"user_handle":"Ef5JiMpMRwuzauWs/9J0gQ=="}`
 				i := createIdentity(M{identity.CredentialsTypeWebAuthn: {Config: []byte(expected)}})(t)
@@ -1950,7 +2162,7 @@ func TestHandler(t *testing.T) {
 				res := get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
 				assert.EqualValues(t, i.ID.String(), res.Get("id").String(), "%s", res.Raw)
 
-				actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+				actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 				require.NoError(t, err)
 				snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(append(ignoreDefault, "hashed_password")...), snapshotx.ExceptPaths("credentials.oidc.identifiers"))
 			})
@@ -2021,7 +2233,7 @@ func TestHandler(t *testing.T) {
 				res := get(t, ts, "/identities/"+i.ID.String(), http.StatusOK)
 				assert.EqualValues(t, i.ID.String(), res.Get("id").String(), "%s", res.Raw)
 
-				actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, uuid.FromStringOrNil(res.Get("id").String()))
+				actual, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), uuid.FromStringOrNil(res.Get("id").String()))
 				require.NoError(t, err)
 				snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual), snapshotx.ExceptNestedKeys(append(ignoreDefault, "hashed_password")...), snapshotx.ExceptPaths("credentials.oidc.identifiers"))
 			})
@@ -2098,17 +2310,15 @@ func TestHandler(t *testing.T) {
 
 	t.Run("case=should paginate all identities", func(t *testing.T) {
 		// Start new server
-		conf, reg := internal.NewFastRegistryWithMocks(t)
+		_, reg := pkg.NewFastRegistryWithMocks(t,
+			configx.WithValues(testhelpers.IdentitySchemasConfig(map[string]string{
+				"default":         "file://./stub/identity.schema.json",
+				"customer":        "file://./stub/handler/customer.schema.json",
+				"multiple_emails": "file://./stub/handler/multiple_emails.schema.json",
+				"employee":        "file://./stub/handler/employee.schema.json",
+			})),
+		)
 		_, ts := testhelpers.NewKratosServerWithCSRF(t, reg)
-		mockServerURL := urlx.ParseOrPanic(publicTS.URL)
-		conf.MustSet(ctx, config.ViperKeyAdminBaseURL, ts.URL)
-		testhelpers.SetIdentitySchemas(t, conf, map[string]string{
-			"default":         "file://./stub/identity.schema.json",
-			"customer":        "file://./stub/handler/customer.schema.json",
-			"multiple_emails": "file://./stub/handler/multiple_emails.schema.json",
-			"employee":        "file://./stub/handler/employee.schema.json",
-		})
-		conf.MustSet(ctx, config.ViperKeyPublicBaseURL, mockServerURL.String())
 
 		var toCreate []*identity.Identity
 		count := 500
@@ -2211,13 +2421,13 @@ func validCreateIdentityBody(t *testing.T, prefix string, i int, plainPassword b
 		traits.Emails = append(traits.Emails, email)
 		verifiableAddresses = append(verifiableAddresses, identity.VerifiableAddress{
 			Value:    email,
-			Via:      identity.VerifiableAddressTypeEmail,
+			Via:      identity.AddressTypeEmail,
 			Verified: j%2 == 0,
 			Status:   verificationStates[j%len(verificationStates)],
 		})
 		recoveryAddresses = append(recoveryAddresses, identity.RecoveryAddress{
 			Value: email,
-			Via:   identity.RecoveryAddressTypeEmail,
+			Via:   identity.AddressTypeEmail,
 		})
 	}
 	traits.Username = traits.Emails[0]
@@ -2229,6 +2439,10 @@ func validCreateIdentityBody(t *testing.T, prefix string, i int, plainPassword b
 		g, err := bcrypt.GenerateFromPassword([]byte(fmt.Sprintf("password-%d", i)), 6)
 		require.NoError(t, err)
 		conf.Password = string(g)
+	}
+	externalID := ""
+	if i%2 == 0 {
+		externalID = fmt.Sprintf("external-id-%s-%d", prefix, i)
 	}
 	return &identity.CreateIdentityBody{
 		SchemaID: "multiple_emails",
@@ -2243,6 +2457,7 @@ func validCreateIdentityBody(t *testing.T, prefix string, i int, plainPassword b
 		MetadataPublic:      json.RawMessage(fmt.Sprintf(`{"public-%d":"public"}`, i)),
 		MetadataAdmin:       json.RawMessage(fmt.Sprintf(`{"admin-%d":"admin"}`, i)),
 		State:               "active",
+		ExternalID:          externalID,
 	}
 }
 

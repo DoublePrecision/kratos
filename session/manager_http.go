@@ -11,6 +11,7 @@ import (
 
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
+	"github.com/ory/x/logrusx"
 
 	"go.opentelemetry.io/otel/attribute"
 
@@ -52,9 +53,9 @@ type (
 		identity.PrivilegedPoolProvider
 		identity.ManagementProvider
 		x.CookieProvider
-		x.LoggingProvider
+		logrusx.Provider
 		nosurfx.CSRFProvider
-		x.TracingProvider
+		otelx.Provider
 		x.TransactionPersistenceProvider
 		PersistenceProvider
 		sessiontokenexchange.PersistenceProvider
@@ -138,7 +139,7 @@ func (s *ManagerHTTP) IssueCookie(ctx context.Context, w http.ResponseWriter, r 
 	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.IssueCookie")
 	defer otelx.End(span, &err)
 
-	cookie, err := s.r.CookieManager(r.Context()).Get(r, s.cookieName(ctx))
+	cookie, err := s.r.CookieManager(ctx).Get(r, s.cookieName(ctx))
 	// Fix for https://github.com/ory/kratos/issues/1695
 	if err != nil && cookie == nil {
 		return errors.WithStack(err)
@@ -316,12 +317,17 @@ func (s *ManagerHTTP) DoesSessionSatisfy(ctx context.Context, sess *Session, req
 		o(managerOpts)
 	}
 
-	loginURL := urlx.CopyWithQuery(urlx.AppendPaths(s.r.Config().SelfPublicURL(ctx), "/self-service/login/browser"), url.Values{"aal": {"aal2"}})
+	loginURL := urlx.AppendPaths(s.r.Config().SelfPublicURL(ctx), "/self-service/login/browser")
+	query := url.Values{
+		"aal": {"aal2"},
+	}
 
 	// return to the requestURL if it was set
 	if managerOpts.requestURL != "" {
-		loginURL = urlx.CopyWithQuery(loginURL, url.Values{"return_to": {managerOpts.requestURL}})
+		query.Set("return_to", managerOpts.requestURL)
 	}
+
+	loginURL.RawQuery = query.Encode()
 
 	switch requestedAAL {
 	case string(identity.AuthenticatorAssuranceLevel1):
